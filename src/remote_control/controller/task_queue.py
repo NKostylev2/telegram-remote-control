@@ -1,0 +1,386 @@
+"""Sequential background task queue worker and lifecycle executor."""
+
+from __future__ import annotations
+
+import asyncio
+import html
+import logging
+from typing import Any
+
+from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError
+from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+
+from remote_control.agent.agy_client import AgyClient
+from remote_control.common.models import TaskResult, TaskStatus
+from remote_control.controller.task_store import TaskRecord, TaskStore
+
+logger = logging.getLogger(__name__)
+
+_MAX_TELEGRAM_MESSAGE_LENGTH = 4000
+
+
+def _build_post_execution_keyboard(operation_id: str) -> InlineKeyboardMarkup:
+    """Build follow-up actions keyboard after task completion."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="💬 Новый запрос в этой папке",
+                    callback_data=f"post:same:{operation_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📁 Сменить директорию",
+                    callback_data="post:change",
+                ),
+            ],
+        ]
+    )
+
+
+def _format_task_result_message(result: TaskResult, workspace_display: str, task_id: int) -> str:
+    """Format TaskResult safely into an informative Telegram HTML message."""
+    status_header = {
+        TaskStatus.SUCCESS: f"✅ <b>Задача #{task_id} выполнена</b>",
+        TaskStatus.PARTIAL_SUCCESS: f"⚠️ <b>Задача #{task_id} выполнена с ограничениями</b>",
+        TaskStatus.ERROR: f"❌ <b>Ошибка при выполнении задачи #{task_id}</b>",
+        TaskStatus.CANCELED: f"⚪ <b>Задача #{task_id} отменена</b>",
+        TaskStatus.INTERRUPTED: f"⏱️ <b>Выполнение задачи #{task_id} прервано</b>",
+    }.get(result.status, f"ℹ️ <b>Задача #{task_id}: Статус {result.status}</b>")
+
+    lines = [
+        status_header,
+        f"📁 Директория: <code>{html.escape(workspace_display)}</code>",
+        f"⏱️ Длительность: {result.duration_seconds:.1f} сек.",
+    ]
+
+    if result.conversation_id:
+        lines.append(f"🆔 Conversation ID: <code>{html.escape(result.conversation_id)}</code>")
+
+    if result.soft_denied_tools:
+        tools_str = ", ".join(result.soft_denied_tools)
+        lines.append(
+            f"⚠️ <i>Отклонённые инструменты (soft-denied):</i> "
+            f"<code>{html.escape(tools_str)}</code>"
+        )
+
+    if result.warnings:
+        warn_str = "; ".join(result.warnings[:3])
+        lines.append(f"⚠️ <i>Предупреждения:</i> {html.escape(warn_str)}")
+
+    if result.error:
+        err_snippet = result.error[:500]
+        lines.append(f"\n❌ <b>Ошибка:</b>\n<pre>{html.escape(err_snippet)}</pre>")
+
+    if result.response and result.response.strip():
+        resp_text = result.response.strip()
+        lines.append("\n📝 <b>Ответ модели:</b>")
+        # Budget max 2500 characters for snippet so whole message is safely <= 4000 characters
+        if len(resp_text) > 2500:
+            snippet = resp_text[:2500]
+            lines.append(f"<pre>{html.escape(snippet)}</pre>")
+            lines.append(
+                "<i>[... вывод обрезан по лимиту Telegram, полный файл прикреплён]</i>"
+            )
+        else:
+            lines.append(f"<pre>{html.escape(resp_text)}</pre>")
+    elif not result.error:
+        lines.append(
+            "\n📝 <b>Результат:</b> "
+            "<i>Действие выполнено на хосте (текстовый вывод отсутствует).</i>"
+        )
+
+    return "\n".join(lines)
+
+
+class TaskQueue:
+    """Sequential background task worker ensuring single-task execution from SQLite."""
+
+    def __init__(
+        self,
+        task_store: TaskStore,
+        agy_client: AgyClient,
+        bot: Bot | None = None,
+    ) -> None:
+        self.task_store = task_store
+        self.agy_client = agy_client
+        self.bot = bot
+
+        self._work_available = asyncio.Event()
+        self._running = False
+        self._worker_task: asyncio.Task[None] | None = None
+
+        # Active task tracking for cancellation and concurrency safety
+        self._current_task_record: TaskRecord | None = None
+        self._current_exec_task: asyncio.Task[TaskResult] | None = None
+        self._cancel_lock = asyncio.Lock()
+
+    def set_bot(self, bot: Bot) -> None:
+        """Inject or update Bot instance."""
+        self.bot = bot
+
+    def notify(self) -> None:
+        """Signal the background worker that new work has been enqueued."""
+        self._work_available.set()
+
+    def start(self) -> None:
+        """Start the background queue worker."""
+        if self._running:
+            return
+        self._running = True
+        self._worker_task = asyncio.create_task(self._worker_loop(), name="task_queue_worker")
+        logger.info("Task queue worker started.")
+
+    async def stop(self) -> None:
+        """Stop the background queue worker and await its termination."""
+        if not self._running:
+            return
+        logger.info("Stopping task queue worker...")
+        self._running = False
+        self._work_available.set()
+
+        # If a task is currently executing, cancel it
+        if self._current_exec_task and not self._current_exec_task.done():
+            self._current_exec_task.cancel()
+
+        if self._worker_task:
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._worker_task = None
+        logger.info("Task queue worker stopped.")
+
+    async def _worker_loop(self) -> None:
+        """Main loop: sequentially processes tasks from SQLite."""
+        while self._running:
+            try:
+                # 1. Look for next queued task in database
+                task = await self.task_store.get_next_queued_task()
+                if task is None:
+                    # Wait for new work signal or periodic check
+                    self._work_available.clear()
+                    try:
+                        await asyncio.wait_for(self._work_available.wait(), timeout=5.0)
+                    except TimeoutError:
+                        pass
+                    continue
+
+                # 2. Process this task
+                await self._process_single_task(task)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.exception("Unexpected error in task queue worker loop: %s", e)
+                await asyncio.sleep(2.0)
+
+    async def _process_single_task(self, task: TaskRecord) -> None:
+        """Execute a single task with state transitions and Telegram notifications."""
+        # Atomically transition QUEUED -> RUNNING in database
+        marked = await self.task_store.mark_task_running(task.id)
+        if not marked:
+            logger.info("Task #%d was not in QUEUED state (possibly cancelled). Skipping.", task.id)
+            return
+
+        self._current_task_record = task
+        display_dir = (
+            str(task.workspace_path)
+            if task.workspace_path
+            else task.workspace_alias
+        )
+
+        logger.info("Starting execution of Task #%d (User: %d)...", task.id, task.user_id)
+
+        # Notify Telegram user that task is now RUNNING
+        if self.bot is not None:
+            try:
+                await self.bot.send_message(
+                    chat_id=task.chat_id,
+                    text=(
+                        f"🚀 <b>Задача #{task.id} запущена на выполнение!</b>\n\n"
+                        f"📁 Директория: <code>{html.escape(display_dir)}</code>\n"
+                        f"⚙️ Режим рассуждения: <code>{html.escape(task.effort.upper())}</code>\n\n"
+                        "<i>Выполняется вызов Antigravity CLI, ожидайте результат...</i>"
+                    ),
+                    parse_mode="HTML",
+                )
+            except TelegramAPIError as e:
+                logger.warning("Failed sending start notification for Task #%d: %s", task.id, e)
+            except Exception as e:
+                logger.debug("Non-Telegram error sending start notification: %s", e)
+
+        # Execute via AgyClient inside cancellable task
+        async with self._cancel_lock:
+            self._current_exec_task = asyncio.create_task(
+                self.agy_client.execute(
+                    prompt=task.prompt,
+                    workspace_alias=task.workspace_alias if not task.workspace_path else None,
+                    workspace_path=task.workspace_path,
+                    effort=task.effort,
+                )
+            )
+
+        try:
+            result = await self._current_exec_task
+        except asyncio.CancelledError:
+            logger.info("Task #%d execution task was cancelled.", task.id)
+            result = TaskResult(
+                task_id=task.operation_id,
+                status=TaskStatus.CANCELED,
+                exit_code=130,
+                error="Исполнение задачи было принудительно отменено.",
+            )
+        except Exception as e:
+            logger.exception("CLI execution exception for Task #%d: %s", task.id, e)
+            result = TaskResult(
+                task_id=task.operation_id,
+                status=TaskStatus.ERROR,
+                exit_code=1,
+                error=f"Внутренняя ошибка выполнения CLI: {e}",
+            )
+        finally:
+            self._current_exec_task = None
+            self._current_task_record = None
+
+        # Save result file if there's response content
+        result_file_path = None
+        if result.response and result.response.strip():
+            try:
+                result_file_path = self.task_store.save_result_file(task.id, result.response)
+            except Exception as e:
+                logger.error("Failed saving result file for Task #%d: %s", task.id, e)
+
+        # Record completion in SQLite
+        await self.task_store.mark_task_finished(
+            task_id=task.id,
+            result=result,
+            result_file_path=result_file_path,
+        )
+        logger.info(
+            "Task #%d finished with status '%s' in %.2fs.",
+            task.id,
+            result.status.value,
+            result.duration_seconds,
+        )
+
+        # Deliver result and files to Telegram user
+        await self._deliver_result(task, result, display_dir, result_file_path)
+
+    async def _deliver_result(
+        self,
+        task: TaskRecord,
+        result: TaskResult,
+        display_dir: str,
+        result_file_path: Any,
+    ) -> None:
+        """Deliver execution result and documents to Telegram user."""
+        if self.bot is None:
+            return
+
+        msg_text = _format_task_result_message(result, display_dir, task.id)
+        keyboard = _build_post_execution_keyboard(task.operation_id)
+
+        # 1. Deliver text message (with HTML and fallback)
+        try:
+            await self.bot.send_message(
+                chat_id=task.chat_id,
+                text=msg_text,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+            )
+        except TelegramAPIError as e:
+            logger.warning(
+                "Failed delivering HTML result for Task #%d: %s. Trying plain text fallback.",
+                task.id,
+                e,
+            )
+            try:
+                import re
+
+                plain = re.sub(r"<[^>]+>", "", msg_text)
+                await self.bot.send_message(
+                    chat_id=task.chat_id,
+                    text=plain[:4000],
+                    reply_markup=keyboard,
+                )
+            except Exception as ex2:
+                logger.error("Failed plain text delivery fallback for Task #%d: %s", task.id, ex2)
+        except Exception as e:
+            logger.debug("Non-Telegram error delivering result: %s", e)
+
+        # 2. In a separate independent block, deliver full document if long or saved
+        if result.response and len(result.response) > 3000:
+            try:
+                doc = BufferedInputFile(
+                    result.response.encode("utf-8"),
+                    filename=f"task_{task.id}_output.txt",
+                )
+                await self.bot.send_document(
+                    chat_id=task.chat_id,
+                    document=doc,
+                    caption=f"📄 Полный вывод задачи #{task.id}",
+                )
+            except Exception as e:
+                logger.warning("Failed delivering result document for Task #%d: %s", task.id, e)
+
+    async def cancel_task(self, task_id: int, user_id: int) -> tuple[bool, str, TaskRecord | None]:
+        """Cancel a task by ID whether it is queued or currently running."""
+        # 1. Fetch current state from DB
+        task = await self.task_store.get_task(task_id)
+        if task is None:
+            return False, f"Задача с ID <code>{task_id}</code> не найдена.", None
+
+        if task.user_id != user_id:
+            return False, f"Вы не являетесь владельцем задачи #{task_id}.", None
+
+        # 2. Check if already finished
+        if task.status not in (TaskStatus.QUEUED, TaskStatus.RUNNING):
+            status_desc = {
+                TaskStatus.SUCCESS: "успешно выполнена",
+                TaskStatus.PARTIAL_SUCCESS: "выполнена с ограничениями",
+                TaskStatus.ERROR: "завершена с ошибкой",
+                TaskStatus.CANCELED: "уже отменена",
+                TaskStatus.INTERRUPTED: "прервана",
+            }.get(task.status, task.status.value)
+            return False, f"Задача #{task_id} {status_desc}. Её нельзя отменить.", task
+
+        # 3. If currently RUNNING
+        if task.status == TaskStatus.RUNNING:
+            async with self._cancel_lock:
+                if self._current_task_record and self._current_task_record.id == task_id:
+                    if self._current_exec_task and not self._current_exec_task.done():
+                        self._current_exec_task.cancel()
+                        # Wait briefly for cancellation to propagate and finalize
+                        await asyncio.sleep(0.5)
+
+            # Re-fetch task state after cancellation attempt
+            updated = await self.task_store.get_task(task_id)
+            if updated and updated.status == TaskStatus.CANCELED:
+                return (
+                    True,
+                    f"Выполняющаяся задача #{task_id} была успешно прервана и отменена.",
+                    updated,
+                )
+            if updated and updated.status != TaskStatus.RUNNING:
+                # Race condition: finished just before cancellation
+                return (
+                    False,
+                    f"Задача #{task_id} успела завершиться со статусом {updated.status.value}.",
+                    updated,
+                )
+            # Force mark cancelled if CLI cancellation was acknowledged
+            await self.task_store.mark_task_canceled(
+                task_id, reason="Принудительно отменено пользователем."
+            )
+            updated = await self.task_store.get_task(task_id)
+            return True, f"Выполняющаяся задача #{task_id} отменена.", updated
+
+        # 4. If QUEUED
+        success, err, updated_record = await self.task_store.cancel_queued_task(task_id, user_id)
+        if success:
+            return True, f"Задача #{task_id} отменена и удалена из очереди.", updated_record
+        return False, err, updated_record
