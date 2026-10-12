@@ -327,3 +327,89 @@ class TestTaskQueueErrorHandling:
                     assert secret_word not in record.getMessage()
 
         asyncio.run(_test())
+
+    def test_lost_wakeup_avoided_when_task_enqueued_around_worker_cycle(
+        self, test_store: TaskStore, mock_client: MagicMock, mock_bot: MagicMock
+    ) -> None:
+        """Stage 4: Enqueueing immediately wakes the worker without waiting for full 5s timeout."""
+        async def _test() -> None:
+            queue = TaskQueue(task_store=test_store, agy_client=mock_client, bot=mock_bot)
+            queue.start()
+
+            # Let worker enter idle waiting state
+            await asyncio.sleep(0.05)
+
+            import time
+            t0 = time.monotonic()
+            task = await test_store.enqueue_task(_make_op("op-lost-wakeup", "Prompt 1"))
+            queue.notify()
+
+            # Worker should wake up and complete task well within 1.0s (timeout is 5.0s)
+            completed = False
+            for _ in range(20):
+                r = await test_store.get_task(task.id)
+                if r and r.status == TaskStatus.SUCCESS:
+                    completed = True
+                    break
+                await asyncio.sleep(0.05)
+
+            elapsed = time.monotonic() - t0
+            await queue.stop()
+
+            assert completed is True
+            assert elapsed < 1.5, (
+                f"Expected task to execute quickly without 5s timeout, took {elapsed:.2f}s"
+            )
+
+        asyncio.run(_test())
+
+    def test_cli_execution_starts_without_waiting_for_slow_telegram_notification(
+        self, test_store: TaskStore, mock_client: MagicMock, mock_bot: MagicMock
+    ) -> None:
+        """Stage 5: Slow Telegram start message does not delay AgyClient.execute invocation."""
+        async def _test() -> None:
+            tg_started = asyncio.Event()
+            cli_started = asyncio.Event()
+
+            async def slow_send_message(*args: object, **kwargs: object) -> None:
+                tg_started.set()
+                # Artificial delay simulating slow Telegram API
+                await asyncio.sleep(1.0)
+
+            mock_bot.send_message.side_effect = slow_send_message
+
+            async def fake_execute(*args: object, **kwargs: object) -> TaskResult:
+                cli_started.set()
+                return TaskResult(
+                    task_id=uuid4(),
+                    status=TaskStatus.SUCCESS,
+                    response="Quick CLI response",
+                    duration_seconds=0.1,
+                )
+
+            mock_client.execute.side_effect = fake_execute
+
+            task = await test_store.enqueue_task(_make_op("op-slow-tg", "Fast CLI task"))
+            queue = TaskQueue(task_store=test_store, agy_client=mock_client, bot=mock_bot)
+            queue.start()
+
+            # CLI should start immediately (< 0.5s), even though Telegram API sleeps 1.0s
+            try:
+                await asyncio.wait_for(cli_started.wait(), timeout=0.5)
+            except TimeoutError:
+                pytest.fail("CLI execution was blocked waiting for Telegram send_message!")
+
+            # Verify task finishes properly
+            for _ in range(25):
+                r = await test_store.get_task(task.id)
+                if r and r.status == TaskStatus.SUCCESS:
+                    break
+                await asyncio.sleep(0.05)
+
+            await queue.stop()
+            final_task = await test_store.get_task(task.id)
+            assert final_task is not None
+            assert final_task.status == TaskStatus.SUCCESS
+
+        asyncio.run(_test())
+

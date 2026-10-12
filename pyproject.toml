@@ -22,6 +22,7 @@ dependencies = [
 
 [project.scripts]
 remote-control-bot = "remote_control.controller.main:main"
+remote-control-agent = "remote_control.agent.main:main"
 
 [project.optional-dependencies]
 dev = [

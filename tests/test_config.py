@@ -193,6 +193,17 @@ class TestValidationErrors:
             AppConfig(AGENT_AUTH_SECRET="short_secret")
         assert "AGENT_AUTH_SECRET must be at least 16 characters" in str(exc_info.value)
 
+    @pytest.mark.parametrize("size", [0, -5, 1001, 5000])
+    def test_invalid_max_queue_size(self, size: int) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            AppConfig(MAX_QUEUE_SIZE=size)
+        assert "MAX_QUEUE_SIZE must be between 1 and 1000" in str(exc_info.value)
+
+    def test_auto_approve_permissions_default_false(self) -> None:
+        config = AppConfig()
+        assert config.cli_auto_approve_permissions is False
+        assert config.max_queue_size == 50
+
 
 class TestSecretProtection:
     """Tests ensuring secrets are NEVER leaked in logs, summaries, or str/repr."""

@@ -12,6 +12,7 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 
 from remote_control.agent.agy_client import AgyClient
+from remote_control.common.executor import LocalTaskExecutor, TaskExecutor
 from remote_control.common.models import TaskResult, TaskStatus
 from remote_control.controller.task_store import TaskRecord, TaskStore
 
@@ -101,12 +102,20 @@ class TaskQueue:
     def __init__(
         self,
         task_store: TaskStore,
-        agy_client: AgyClient,
+        agy_client: AgyClient | None = None,
         bot: Bot | None = None,
+        executor: TaskExecutor | None = None,
     ) -> None:
         self.task_store = task_store
         self.agy_client = agy_client
         self.bot = bot
+
+        if executor is not None:
+            self.executor = executor
+        elif agy_client is not None:
+            self.executor = LocalTaskExecutor(agy_client)
+        else:
+            raise ValueError("Either executor or agy_client must be provided to TaskQueue.")
 
         self._work_available = asyncio.Event()
         self._running = False
@@ -116,6 +125,7 @@ class TaskQueue:
         self._current_task_record: TaskRecord | None = None
         self._current_exec_task: asyncio.Task[TaskResult] | None = None
         self._cancel_lock = asyncio.Lock()
+        self._pending_bg_tasks: set[asyncio.Task[Any]] = set()
 
     def set_bot(self, bot: Bot) -> None:
         """Inject or update Bot instance."""
@@ -145,6 +155,13 @@ class TaskQueue:
         if self._current_exec_task and not self._current_exec_task.done():
             self._current_exec_task.cancel()
 
+        # Cancel and await all pending background notification tasks
+        if self._pending_bg_tasks:
+            for t in list(self._pending_bg_tasks):
+                t.cancel()
+            await asyncio.gather(*self._pending_bg_tasks, return_exceptions=True)
+            self._pending_bg_tasks.clear()
+
         if self._worker_task:
             self._worker_task.cancel()
             try:
@@ -158,18 +175,32 @@ class TaskQueue:
         """Main loop: sequentially processes tasks from SQLite."""
         while self._running:
             try:
-                # 1. Look for next queued task in database
+                # 1. Clear work signal BEFORE checking DB to eliminate lost wakeup race condition
+                self._work_available.clear()
+
+                # 2. Look for next queued task in database
                 task = await self.task_store.get_next_queued_task()
                 if task is None:
                     # Wait for new work signal or periodic check
-                    self._work_available.clear()
                     try:
                         await asyncio.wait_for(self._work_available.wait(), timeout=5.0)
                     except TimeoutError:
                         pass
                     continue
 
-                # 2. Process this task
+                # If executor is temporarily unavailable (e.g. Windows Agent offline in
+                # distributed mode), leave task in QUEUED and wait for readiness.
+                if not self.executor.is_available():
+                    logger.debug(
+                        "Task #%d waiting in queue: executor is not available yet.", task.id
+                    )
+                    try:
+                        await asyncio.wait_for(self._work_available.wait(), timeout=5.0)
+                    except TimeoutError:
+                        pass
+                    continue
+
+                # 3. Process this task
                 await self._process_single_task(task)
 
             except asyncio.CancelledError:
@@ -177,6 +208,26 @@ class TaskQueue:
             except Exception as e:
                 logger.exception("Unexpected error in task queue worker loop: %s", e)
                 await asyncio.sleep(2.0)
+
+    async def _send_start_notification(self, task: TaskRecord, display_dir: str) -> None:
+        """Asynchronously send start notification to Telegram without blocking CLI execution."""
+        if self.bot is None:
+            return
+        try:
+            await self.bot.send_message(
+                chat_id=task.chat_id,
+                text=(
+                    f"🚀 <b>Задача #{task.id} запущена на выполнение!</b>\n\n"
+                    f"📁 Директория: <code>{html.escape(display_dir)}</code>\n"
+                    f"⚙️ Режим рассуждения: <code>{html.escape(task.effort.upper())}</code>\n\n"
+                    "<i>Выполняется вызов Antigravity CLI, ожидайте результат...</i>"
+                ),
+                parse_mode="HTML",
+            )
+        except TelegramAPIError as e:
+            logger.warning("Failed sending start notification for Task #%d: %s", task.id, e)
+        except Exception as e:
+            logger.debug("Non-Telegram error sending start notification: %s", e)
 
     async def _process_single_task(self, task: TaskRecord) -> None:
         """Execute a single task with state transitions and Telegram notifications."""
@@ -195,33 +246,18 @@ class TaskQueue:
 
         logger.info("Starting execution of Task #%d (User: %d)...", task.id, task.user_id)
 
-        # Notify Telegram user that task is now RUNNING
+        # Non-blocking dispatch: notify Telegram user without delaying CLI start
         if self.bot is not None:
-            try:
-                await self.bot.send_message(
-                    chat_id=task.chat_id,
-                    text=(
-                        f"🚀 <b>Задача #{task.id} запущена на выполнение!</b>\n\n"
-                        f"📁 Директория: <code>{html.escape(display_dir)}</code>\n"
-                        f"⚙️ Режим рассуждения: <code>{html.escape(task.effort.upper())}</code>\n\n"
-                        "<i>Выполняется вызов Antigravity CLI, ожидайте результат...</i>"
-                    ),
-                    parse_mode="HTML",
-                )
-            except TelegramAPIError as e:
-                logger.warning("Failed sending start notification for Task #%d: %s", task.id, e)
-            except Exception as e:
-                logger.debug("Non-Telegram error sending start notification: %s", e)
+            notify_task = asyncio.create_task(
+                self._send_start_notification(task, display_dir)
+            )
+            self._pending_bg_tasks.add(notify_task)
+            notify_task.add_done_callback(self._pending_bg_tasks.discard)
 
-        # Execute via AgyClient inside cancellable task
+        # Execute via configured executor inside cancellable task
         async with self._cancel_lock:
             self._current_exec_task = asyncio.create_task(
-                self.agy_client.execute(
-                    prompt=task.prompt,
-                    workspace_alias=task.workspace_alias if not task.workspace_path else None,
-                    workspace_path=task.workspace_path,
-                    effort=task.effort,
-                )
+                self.executor.execute_task(task)
             )
 
         try:
@@ -250,7 +286,9 @@ class TaskQueue:
         result_file_path = None
         if result.response and result.response.strip():
             try:
-                result_file_path = self.task_store.save_result_file(task.id, result.response)
+                result_file_path = await self.task_store.save_result_file_async(
+                    task.id, result.response
+                )
             except Exception as e:
                 logger.error("Failed saving result file for Task #%d: %s", task.id, e)
 
@@ -338,7 +376,7 @@ class TaskQueue:
             return False, f"Вы не являетесь владельцем задачи #{task_id}.", None
 
         # 2. Check if already finished
-        if task.status not in (TaskStatus.QUEUED, TaskStatus.RUNNING):
+        if task.status not in (TaskStatus.QUEUED, TaskStatus.ASSIGNED, TaskStatus.RUNNING):
             status_desc = {
                 TaskStatus.SUCCESS: "успешно выполнена",
                 TaskStatus.PARTIAL_SUCCESS: "выполнена с ограничениями",
@@ -348,14 +386,15 @@ class TaskQueue:
             }.get(task.status, task.status.value)
             return False, f"Задача #{task_id} {status_desc}. Её нельзя отменить.", task
 
-        # 3. If currently RUNNING
-        if task.status == TaskStatus.RUNNING:
+        # 3. If currently RUNNING or ASSIGNED
+        if task.status in (TaskStatus.RUNNING, TaskStatus.ASSIGNED):
             async with self._cancel_lock:
                 if self._current_task_record and self._current_task_record.id == task_id:
                     if self._current_exec_task and not self._current_exec_task.done():
                         self._current_exec_task.cancel()
-                        # Wait briefly for cancellation to propagate and finalize
-                        await asyncio.sleep(0.5)
+                await self.executor.cancel_task(task)
+                # Wait briefly for cancellation to propagate and finalize
+                await asyncio.sleep(0.5)
 
             # Re-fetch task state after cancellation attempt
             updated = await self.task_store.get_task(task_id)
@@ -365,7 +404,7 @@ class TaskQueue:
                     f"Выполняющаяся задача #{task_id} была успешно прервана и отменена.",
                     updated,
                 )
-            if updated and updated.status != TaskStatus.RUNNING:
+            if updated and updated.status not in (TaskStatus.RUNNING, TaskStatus.ASSIGNED):
                 # Race condition: finished just before cancellation
                 return (
                     False,

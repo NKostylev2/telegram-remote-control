@@ -12,7 +12,9 @@ from aiogram.types import BotCommand, BotCommandScopeDefault
 
 from remote_control.agent.agy_client import AgyClient
 from remote_control.config import AppConfig, load_config
+from remote_control.controller.agent_dispatcher import AgentDispatcher
 from remote_control.controller.bot import create_bot, create_dispatcher
+from remote_control.controller.server import ControllerServer
 from remote_control.controller.single_instance import SingleInstanceError, SingleInstanceLock
 from remote_control.controller.task_queue import TaskQueue
 from remote_control.controller.task_store import TaskStore
@@ -83,16 +85,25 @@ async def run_bot(config: AppConfig | None = None) -> None:
         instance_lock.release()
         sys.exit(1)
 
-    # 3. Create bot, client, queue worker, and dispatcher
+    # 3. Optional HTTP API server for distributed mode
+    agent_dispatcher = None
+    server = None
+    if config.controller_mode == "distributed":
+        agent_dispatcher = AgentDispatcher(config)
+        server = ControllerServer(config, agent_dispatcher)
+        await server.start()
+
+    # 4. Create bot, client, queue worker, and dispatcher
     bot = create_bot(config)
     agy_client = AgyClient(config)
-    task_queue = TaskQueue(task_store=task_store, agy_client=agy_client, bot=bot)
     dp = create_dispatcher(
         config=config,
         agy_client=agy_client,
         task_store=task_store,
-        task_queue=task_queue,
+        agent_dispatcher=agent_dispatcher,
     )
+    task_queue: TaskQueue = dp["task_queue"]
+    task_queue.set_bot(bot)
 
     logger.info("Инициализация завершена. Запуск очереди задач и Long Polling...")
     task_queue.start()
@@ -117,6 +128,8 @@ async def run_bot(config: AppConfig | None = None) -> None:
         sys.exit(1)
     finally:
         await task_queue.stop()
+        if server is not None:
+            await server.stop()
         instance_lock.release()
         await bot.session.close()
         logger.info("Сессия Telegram Bot закрыта. Завершение работы.")

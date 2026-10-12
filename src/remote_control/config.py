@@ -74,7 +74,7 @@ class AppConfig(BaseSettings):
         description="Timeout in seconds for interactive confirmation of /run tasks",
     )
     cli_auto_approve_permissions: bool = Field(
-        default=True,
+        default=False,
         alias="CLI_AUTO_APPROVE_PERMISSIONS",
         description="Auto-approve tool permissions in non-interactive CLI executions",
     )
@@ -133,6 +133,11 @@ class AppConfig(BaseSettings):
         default=Path("data/results"),
         alias="TASK_RESULTS_DIR",
         description="Path to directory for saving long execution results",
+    )
+    max_queue_size: int = Field(
+        default=50,
+        alias="MAX_QUEUE_SIZE",
+        description="Maximum number of waiting tasks in the queue",
     )
 
     # -------------------------------------------------------------------------
@@ -352,6 +357,13 @@ class AppConfig(BaseSettings):
             return Path("data/results").resolve()
         return Path(v).resolve()
 
+    @field_validator("max_queue_size")
+    @classmethod
+    def _validate_max_queue_size(cls, v: int) -> int:
+        if v < 1 or v > 1000:
+            raise ValueError(f"MAX_QUEUE_SIZE must be between 1 and 1000 (got {v}).")
+        return v
+
     # -------------------------------------------------------------------------
     # Capability flags
     # -------------------------------------------------------------------------
@@ -390,6 +402,7 @@ class AppConfig(BaseSettings):
             "cli_reasoning_effort": self.cli_reasoning_effort,
             "sqlite_database_path": str(self.sqlite_database_path),
             "task_results_dir": str(self.task_results_dir),
+            "max_queue_size": self.max_queue_size,
             "wol_enabled": self.is_wol_enabled,
             "target_mac": self.target_mac_address,
             "wol_broadcast_ip": self.wol_broadcast_ip,

@@ -103,14 +103,11 @@ def test_message_direct_prompt_initiates_confirmation(tmp_path: Path) -> None:
         lock = asyncio.Lock()
         task_store = MagicMock(spec=TaskStore)
 
-        waiting_msg = MagicMock()
-        waiting_msg.edit_text = AsyncMock()
-
         mock_msg = MagicMock(spec=Message)
         mock_msg.text = "Выдай список процессов"
         mock_msg.from_user = User(id=user_id, is_bot=False, first_name="Tester")
         mock_msg.chat = Chat(id=user_id, type="private")
-        mock_msg.answer = AsyncMock(return_value=waiting_msg)
+        mock_msg.answer = AsyncMock()
 
         await message_direct_prompt(
             message=mock_msg,
@@ -122,11 +119,10 @@ def test_message_direct_prompt_initiates_confirmation(tmp_path: Path) -> None:
         )
 
         mock_msg.answer.assert_awaited_once()
-        waiting_msg.edit_text.assert_awaited_once()
-        text = waiting_msg.edit_text.call_args[0][0]
-        assert "Понимание задачи" in text
+        text = mock_msg.answer.call_args[0][0]
         assert "Выдай список процессов" in text
         assert len(store._operations) == 1
+        mock_client.interpret_prompt.assert_not_awaited()
 
     asyncio.run(_test())
 

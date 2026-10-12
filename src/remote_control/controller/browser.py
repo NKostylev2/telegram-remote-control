@@ -20,7 +20,22 @@ _EXCLUDED_FOLDER_NAMES = {
 def get_available_drives() -> list[str]:
     """Return available system drives on Windows, or root directory on POSIX systems."""
     if sys.platform == "win32":
-        drives: list[str] = []
+        try:
+            import ctypes
+
+            bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+            if bitmask:
+                drives: list[str] = []
+                for i, letter in enumerate(string.ascii_uppercase):
+                    if bitmask & (1 << i):
+                        drives.append(f"{letter}:\\")
+                if drives:
+                    return drives
+        except Exception:
+            pass
+
+        # Fallback if Windows API is unavailable
+        drives = []
         for letter in string.ascii_uppercase:
             drive_path = f"{letter}:\\"
             try:
@@ -47,26 +62,31 @@ def get_parent_directory(path: Path | str) -> Path | None:
 
 
 def list_subdirectories(path: Path | str) -> list[Path]:
-    """Safely return sorted accessible subdirectories of a given folder.
+    """Safely return sorted accessible subdirectories of a given folder using os.scandir().
 
     Excludes hidden files, system folders, and handles permission errors gracefully.
     """
     p = Path(path).resolve()
-    if not p.exists() or not p.is_dir():
-        return []
-
     try:
-        subdirs: list[Path] = []
-        for entry in p.iterdir():
-            try:
-                if (
-                    entry.is_dir()
-                    and not entry.name.startswith((".", "$"))
-                    and entry.name not in _EXCLUDED_FOLDER_NAMES
-                ):
-                    subdirs.append(entry)
-            except (PermissionError, OSError):
-                continue
-        return sorted(subdirs, key=lambda item: item.name.lower())
+        if not p.is_dir():
+            return []
     except (PermissionError, OSError):
         return []
+
+    subdirs: list[Path] = []
+    try:
+        with os.scandir(p) as it:
+            for entry in it:
+                try:
+                    if (
+                        entry.is_dir(follow_symlinks=False)
+                        and not entry.name.startswith((".", "$"))
+                        and entry.name not in _EXCLUDED_FOLDER_NAMES
+                    ):
+                        subdirs.append(Path(entry.path))
+                except (PermissionError, OSError):
+                    continue
+    except (PermissionError, OSError):
+        return []
+
+    return sorted(subdirs, key=lambda item: item.name.lower())

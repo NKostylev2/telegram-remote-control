@@ -102,6 +102,7 @@ class TestCommandArgsConstruction:
         client = AgyClient(sample_config)
         args = client.build_command_args(prompt="Summarize repo")
 
+        # By default, dangerous auto-approval is disabled
         expected = [
             str(mock_cli_path.resolve()),
             "--print",
@@ -109,11 +110,20 @@ class TestCommandArgsConstruction:
             "--output-format",
             "json",
             "--disable-slash-commands",
-            "--dangerously-skip-permissions",
             "--effort",
             "low",
         ]
         assert args == expected
+
+    def test_build_args_with_auto_approve_permissions(
+        self, sample_config: AppConfig, mock_cli_path: Path
+    ) -> None:
+        client = AgyClient(sample_config)
+        args = client.build_command_args(
+            prompt="Summarize repo",
+            dangerously_skip_permissions=True,
+        )
+        assert "--dangerously-skip-permissions" in args
 
     def test_build_args_with_timeout_and_model(
         self, sample_config: AppConfig, mock_cli_path: Path
@@ -631,10 +641,83 @@ class TestSpecialCharactersAndSecurity:
         assert args[print_idx + 1] == special_prompt.strip()
 
         # No shell characters should cause multiple split arguments
-        assert len(args) == 9  # includes --dangerously-skip-permissions and --effort low
+        # Excludes --dangerously-skip-permissions by default, includes --effort low
+        assert len(args) == 8
         assert args[3] == "--output-format"
         assert args[4] == "json"
         assert args[5] == "--disable-slash-commands"
-        assert args[6] == "--dangerously-skip-permissions"
-        assert args[7] == "--effort"
-        assert args[8] == "low"
+        assert args[6] == "--effort"
+        assert args[7] == "low"
+
+    def test_build_command_args_with_conversation_and_continue(
+        self, sample_config: AppConfig
+    ) -> None:
+        """Stage 12: Verify conversation_id and continue_session flags."""
+        client = AgyClient(sample_config)
+
+        # 1. With conversation_id
+        args_conv = client.build_command_args(
+            prompt="Hello",
+            conversation_id="conv-12345",
+        )
+        assert "--conversation" in args_conv
+        conv_idx = args_conv.index("--conversation")
+        assert args_conv[conv_idx + 1] == "conv-12345"
+        assert "--continue" not in args_conv
+
+        # 2. With continue_session
+        args_cont = client.build_command_args(
+            prompt="Hello",
+            continue_session=True,
+        )
+        assert "--continue" in args_cont
+        assert "--conversation" not in args_cont
+
+    def test_cli_path_caching_and_invalidation(
+        self, sample_config: AppConfig, tmp_path: Path
+    ) -> None:
+        """Stage 9: Verify CLI path caching and invalidation."""
+        dummy_exe = tmp_path / "agy.exe"
+        dummy_exe.write_text("dummy")
+
+        sample_config.antigravity_cli_path = str(dummy_exe)
+        client = AgyClient(sample_config)
+
+        assert client._cached_cli_path is None
+        p1 = client.get_cli_path()
+        assert p1 == dummy_exe.resolve()
+        assert client._cached_cli_path == dummy_exe.resolve()
+
+        # Cache hit
+        with patch.object(Path, "is_file", return_value=True):
+            p2 = client.get_cli_path()
+            assert p2 == p1
+
+        # Cache invalidation
+        client.invalidate_cli_cache()
+        assert client._cached_cli_path is None
+
+    def test_read_stream_bounded_truncation_and_draining(self) -> None:
+        """Stage 6: Verify bounded stream reader limits output and drains remaining data."""
+        from remote_control.agent.agy_client import _read_stream_bounded
+
+        async def _test() -> None:
+            # Create a reader with 100KB data
+            data = b"X" * 102400
+            reader = asyncio.StreamReader()
+            reader.feed_data(data)
+            reader.feed_eof()
+
+            # Limit to 10KB
+            limit = 10240
+            result = await _read_stream_bounded(reader, max_bytes=limit)
+
+            assert len(result) > limit  # Contains truncated bytes + notice
+            assert result.startswith(b"X" * limit)
+            assert "Вывод обрезан".encode() in result
+
+            # Ensure stream was drained
+            assert reader.at_eof()
+
+        asyncio.run(_test())
+

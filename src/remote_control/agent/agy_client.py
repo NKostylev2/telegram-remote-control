@@ -47,6 +47,48 @@ _TOOL_DENIED_PATTERNS = (
 _WARNING_KEYWORDS = ("warning:", "warn:", "soft-denied", "permission denied")
 _ERROR_KEYWORDS = ("error:", "fatal:", "exception:", "panic:")
 
+_MAX_STDOUT_BYTES = 5 * 1024 * 1024  # 5 MB limit
+_MAX_STDERR_BYTES = 2 * 1024 * 1024  # 2 MB limit
+_STREAM_CHUNK_SIZE = 64 * 1024  # 64 KB chunk size
+
+
+_TRUNCATION_NOTICE = (
+    "\n\n[... Вывод обрезан по лимиту памяти ...]\n".encode()
+)
+
+
+async def _read_stream_bounded(
+    stream: asyncio.StreamReader | None,
+    max_bytes: int,
+    truncation_notice: bytes = _TRUNCATION_NOTICE,
+) -> bytes:
+    """Read a subprocess stream up to max_bytes, continuing to drain remaining data."""
+    if stream is None:
+        return b""
+
+    chunks: list[bytes] = []
+    total_bytes = 0
+    truncated = False
+
+    while True:
+        chunk = await stream.read(_STREAM_CHUNK_SIZE)
+        if not chunk:
+            break
+        if not truncated:
+            if total_bytes + len(chunk) <= max_bytes:
+                chunks.append(chunk)
+                total_bytes += len(chunk)
+            else:
+                remaining = max_bytes - total_bytes
+                if remaining > 0:
+                    chunks.append(chunk[:remaining])
+                    total_bytes += remaining
+                chunks.append(truncation_notice)
+                truncated = True
+        # If truncated is True, keep reading to drain pipe so child process does not block
+
+    return b"".join(chunks)
+
 
 class AgyClientError(Exception):
     """Base exception for Antigravity CLI adapter errors."""
@@ -85,30 +127,42 @@ class AgyClient:
 
     def __init__(self, config: AppConfig) -> None:
         self.config = config
+        self._cached_cli_path: Path | None = None
+
+    def invalidate_cli_cache(self) -> None:
+        """Clear cached CLI executable path."""
+        self._cached_cli_path = None
 
     def get_cli_path(self) -> Path:
         """Resolve and validate the absolute path to the Antigravity CLI executable.
 
         Order of resolution:
-        1. Explicit path from config (if it points to an existing file).
-        2. Look up command in system PATH using shutil.which.
-        3. Standard Windows fallback: %LOCALAPPDATA%\\agy\\bin\\agy.exe.
+        1. Cached path if valid and points to an existing file.
+        2. Explicit path from config (if it points to an existing file).
+        3. Look up command in system PATH using shutil.which.
+        4. Standard Windows fallback: %LOCALAPPDATA%\\agy\\bin\\agy.exe.
 
         Raises:
             CliNotFoundError: If the binary is not found at any location.
         """
+        if self._cached_cli_path is not None and self._cached_cli_path.is_file():
+            return self._cached_cli_path
+
         cli_setting = self.config.antigravity_cli_path.strip()
 
         # 1. Direct path check
         direct_path = Path(cli_setting)
         if direct_path.is_file():
-            return direct_path.resolve()
+            resolved = direct_path.resolve()
+            self._cached_cli_path = resolved
+            return resolved
 
         # 2. Check system PATH
         which_result = shutil.which(cli_setting)
         if which_result:
             resolved_which = Path(which_result).resolve()
             if resolved_which.is_file():
+                self._cached_cli_path = resolved_which
                 return resolved_which
 
         # 3. Windows standard installation path fallback
@@ -116,7 +170,9 @@ class AgyClient:
         if local_app_data:
             fallback_path = Path(local_app_data) / "agy" / "bin" / "agy.exe"
             if fallback_path.is_file():
-                return fallback_path.resolve()
+                resolved_fallback = fallback_path.resolve()
+                self._cached_cli_path = resolved_fallback
+                return resolved_fallback
 
         raise CliNotFoundError(
             f"Antigravity CLI executable was not found. Configured path: '{cli_setting}'"
@@ -181,6 +237,8 @@ class AgyClient:
         disable_slash_commands: bool = True,
         dangerously_skip_permissions: bool | None = None,
         concise: bool = False,
+        conversation_id: str | None = None,
+        continue_session: bool = False,
     ) -> list[str]:
         """Construct the argument list for invoking agy.exe non-interactively.
 
@@ -233,7 +291,7 @@ class AgyClient:
 
         if dangerously_skip_permissions is None:
             dangerously_skip_permissions = getattr(
-                self.config, "cli_auto_approve_permissions", True
+                self.config, "cli_auto_approve_permissions", False
             )
 
         if dangerously_skip_permissions:
@@ -244,6 +302,11 @@ class AgyClient:
 
         if model:
             args.extend(["--model", model.strip()])
+
+        if conversation_id:
+            args.extend(["--conversation", conversation_id.strip()])
+        elif continue_session:
+            args.append("--continue")
 
         return args
 
@@ -287,7 +350,8 @@ class AgyClient:
         cwd: Path,
         timeout: float,
     ) -> tuple[int, str, str, float]:
-        """Run the CLI subprocess asynchronously with timeout and cancellation protection."""
+        """Run the CLI subprocess asynchronously with timeout, cancellation protection,
+        and bounded output."""
         start_time = time.monotonic()
         proc = await asyncio.create_subprocess_exec(
             *args,
@@ -296,19 +360,47 @@ class AgyClient:
             stderr=asyncio.subprocess.PIPE,
         )
 
+        stdout_task: asyncio.Task[bytes] | None = None
+        stderr_task: asyncio.Task[bytes] | None = None
+
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=timeout,
-            )
+            if isinstance(proc.stdout, asyncio.StreamReader) and isinstance(
+                proc.stderr, asyncio.StreamReader
+            ):
+                stdout_task = asyncio.create_task(
+                    _read_stream_bounded(proc.stdout, _MAX_STDOUT_BYTES)
+                )
+                stderr_task = asyncio.create_task(
+                    _read_stream_bounded(proc.stderr, _MAX_STDERR_BYTES)
+                )
+
+                async def _wait_process_and_streams() -> tuple[bytes, bytes, int]:
+                    s_out, s_err = await asyncio.gather(stdout_task, stderr_task)
+                    code = await proc.wait()
+                    return s_out, s_err, code
+
+                stdout_bytes, stderr_bytes, exit_code = await asyncio.wait_for(
+                    _wait_process_and_streams(),
+                    timeout=timeout,
+                )
+            else:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    proc.communicate(),
+                    timeout=timeout,
+                )
+                exit_code = proc.returncode if proc.returncode is not None else 0
+
             duration = time.monotonic() - start_time
-            exit_code = proc.returncode if proc.returncode is not None else 0
             stdout_str = stdout_bytes.decode("utf-8", errors="replace")
             stderr_str = stderr_bytes.decode("utf-8", errors="replace")
             return exit_code, stdout_str, stderr_str, duration
 
         except TimeoutError as err:
             duration = time.monotonic() - start_time
+            if stdout_task:
+                stdout_task.cancel()
+            if stderr_task:
+                stderr_task.cancel()
             await self._terminate_process(proc)
             raise ExecutionTimeoutError(
                 f"Antigravity CLI execution timed out after {timeout:.1f} seconds."
@@ -316,6 +408,10 @@ class AgyClient:
 
         except asyncio.CancelledError as err:
             duration = time.monotonic() - start_time
+            if stdout_task:
+                stdout_task.cancel()
+            if stderr_task:
+                stderr_task.cancel()
             await self._terminate_process(proc)
             raise ExecutionCancelledError("Task execution was canceled.") from err
 
@@ -512,6 +608,8 @@ class AgyClient:
         model: str | None = None,
         effort: str | None = None,
         concise: bool = True,
+        conversation_id: str | None = None,
+        continue_session: bool = False,
     ) -> TaskResult:
         """Execute an Antigravity CLI task in the specified workspace alias or directory path.
 
@@ -528,6 +626,8 @@ class AgyClient:
                 model=model,
                 effort=effort,
                 concise=concise,
+                conversation_id=conversation_id,
+                continue_session=continue_session,
             )
         except ValueError as e:
             return TaskResult(

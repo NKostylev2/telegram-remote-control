@@ -12,6 +12,7 @@ from remote_control.common.models import TaskStatus
 from remote_control.controller.confirmation import PendingConfirmation
 from remote_control.controller.task_store import (
     DuplicateOperationError,
+    QueueFullError,
     TaskRecord,
     TaskStore,
 )
@@ -69,7 +70,7 @@ class TestTaskStoreInitializationAndMigration:
         with sqlite3.connect(task_store.database_path) as conn:
             cursor = conn.cursor()
             cursor.execute("PRAGMA user_version")
-            assert cursor.fetchone()[0] == 1
+            assert cursor.fetchone()[0] == 2
 
         # Re-running initialization should not fail or corrupt existing data
         task_store.initialize_sync()
@@ -77,7 +78,7 @@ class TestTaskStoreInitializationAndMigration:
         with sqlite3.connect(task_store.database_path) as conn:
             cursor = conn.cursor()
             cursor.execute("PRAGMA user_version")
-            assert cursor.fetchone()[0] == 1
+            assert cursor.fetchone()[0] == 2
 
     def test_unconfirmed_operations_not_in_database(self, task_store: TaskStore) -> None:
         """Req 2: Pending confirmations alone are NOT stored in SQLite."""
@@ -232,3 +233,102 @@ class TestResultFileStorage:
         read_back = task_store.read_result_file(task_id=99)
         assert read_back is not None
         assert "[... Truncated due to size limit ...]" in read_back
+
+    def test_async_save_and_read_result_file(self, task_store: TaskStore) -> None:
+        """Stage 6.2: Asynchronously save and read output file."""
+        import asyncio
+
+        async def _test() -> None:
+            content = "Async output data\nLine 2"
+            path = await task_store.save_result_file_async(task_id=77, content=content)
+            assert path.is_file()
+
+            read_back = await task_store.read_result_file_async(task_id=77)
+            assert read_back == content
+
+        asyncio.run(_test())
+
+
+class TestSchemaMigrationAndQueueLimits:
+    """Stage 8: Tests for real v1 -> v2 schema migration and queue limits."""
+
+    def test_schema_migration_v1_to_v2(self, tmp_path: Path) -> None:
+        """Stage 8.2: Test database migration from v1 to v2 updates indexes."""
+        db_path = tmp_path / "v1_tasks.sqlite3"
+        results_dir = tmp_path / "v1_results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create a database simulating v1 schema
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                CREATE TABLE tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    operation_id TEXT UNIQUE NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    workspace_alias TEXT NOT NULL,
+                    workspace_path TEXT,
+                    prompt TEXT NOT NULL,
+                    interpretation TEXT,
+                    effort TEXT NOT NULL DEFAULT 'low',
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    created_at TEXT NOT NULL,
+                    confirmed_at TEXT NOT NULL,
+                    queued_at TEXT NOT NULL,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    conversation_id TEXT,
+                    exit_code INTEGER,
+                    duration_seconds REAL,
+                    result_summary TEXT,
+                    result_file_path TEXT,
+                    error_message TEXT,
+                    warnings TEXT,
+                    soft_denied_tools TEXT
+                )
+                """
+            )
+            cursor.execute("CREATE INDEX idx_tasks_status ON tasks(status)")
+            cursor.execute("CREATE INDEX idx_tasks_user_id ON tasks(user_id, id DESC)")
+            cursor.execute("CREATE INDEX idx_tasks_operation_id ON tasks(operation_id)")
+            cursor.execute("PRAGMA user_version = 1")
+            conn.commit()
+
+        # Initialize store on existing v1 database
+        store = TaskStore(db_path, results_dir)
+        store.initialize_sync()
+
+        # Verify upgraded to v2
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA user_version")
+            assert cursor.fetchone()[0] == 2
+
+            # Check that idx_tasks_operation_id is removed and idx_tasks_status_id is created
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='tasks'"
+            )
+            indexes = [row[0] for row in cursor.fetchall()]
+            assert "idx_tasks_status_id" in indexes
+            assert "idx_tasks_operation_id" not in indexes
+            assert "idx_tasks_status" not in indexes
+
+    def test_max_queue_size_enforced(self, tmp_path: Path) -> None:
+        """Stage 8.2: Enforce max_queue_size limit when enqueuing tasks."""
+        db_path = tmp_path / "queue_limit.sqlite3"
+        results_dir = tmp_path / "limit_results"
+        store = TaskStore(db_path, results_dir, max_queue_size=2)
+        store.initialize_sync()
+
+        # Enqueue 2 tasks (reaches limit)
+        store.enqueue_task_sync(_make_pending_confirmation("op-limit-1", "Task 1"))
+        store.enqueue_task_sync(_make_pending_confirmation("op-limit-2", "Task 2"))
+
+        # Third task should raise QueueFullError
+        with pytest.raises(QueueFullError) as exc_info:
+            store.enqueue_task_sync(_make_pending_confirmation("op-limit-3", "Task 3"))
+
+        assert "Очередь задач заполнена (2/2)" in str(exc_info.value)
+

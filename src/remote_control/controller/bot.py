@@ -11,7 +11,9 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.types import ErrorEvent
 
 from remote_control.agent.agy_client import AgyClient
+from remote_control.common.executor import LocalTaskExecutor, RemoteTaskExecutor, TaskExecutor
 from remote_control.config import AppConfig
+from remote_control.controller.agent_dispatcher import AgentDispatcher
 from remote_control.controller.confirmation import ConfirmationStore
 from remote_control.controller.handlers import main_router
 from remote_control.controller.middlewares import AuthorizationMiddleware
@@ -47,11 +49,25 @@ def create_dispatcher(
     task_lock: asyncio.Lock | None = None,
     task_store: TaskStore | None = None,
     task_queue: TaskQueue | None = None,
+    agent_dispatcher: AgentDispatcher | None = None,
+    executor: TaskExecutor | None = None,
 ) -> Dispatcher:
     """Create and configure Dispatcher with middlewares, handlers, and dependency injection."""
     dp = Dispatcher()
 
     client = agy_client or AgyClient(config)
+    dispatcher = agent_dispatcher or (
+        AgentDispatcher(config) if config.controller_mode == "distributed" else None
+    )
+
+    if executor is None:
+        if config.controller_mode == "distributed" and dispatcher is not None:
+            active_executor: TaskExecutor = RemoteTaskExecutor(dispatcher)
+        else:
+            active_executor = LocalTaskExecutor(client)
+    else:
+        active_executor = executor
+
     store = task_store or TaskStore(
         database_path=config.sqlite_database_path,
         results_dir=config.task_results_dir,
@@ -60,11 +76,17 @@ def create_dispatcher(
         task_store=store,
         agy_client=client,
         bot=None,
+        executor=active_executor,
     )
+
+    if dispatcher is not None and queue is not None:
+        dispatcher.set_on_agent_online(queue.notify)
 
     # 1. Dependency injection into handlers
     dp["config"] = config
     dp["agy_client"] = client
+    dp["agent_dispatcher"] = dispatcher
+    dp["executor"] = active_executor
     dp["confirmation_store"] = confirmation_store or ConfirmationStore(
         default_ttl_seconds=float(config.confirmation_timeout_seconds)
     )

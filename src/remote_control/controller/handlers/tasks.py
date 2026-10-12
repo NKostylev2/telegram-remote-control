@@ -17,6 +17,7 @@ tasks_router = Router(name="tasks_router")
 
 _STATUS_EMOJIS = {
     TaskStatus.QUEUED: "⏳ В очереди",
+    TaskStatus.ASSIGNED: "📥 Назначена агенту",
     TaskStatus.RUNNING: "🚀 Выполняется",
     TaskStatus.SUCCESS: "✅ Успешно",
     TaskStatus.PARTIAL_SUCCESS: "⚠️ С ограничениями",

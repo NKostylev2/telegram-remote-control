@@ -246,7 +246,7 @@ class TestBaseCommands:
 
         asyncio.run(_test())
 
-    def test_help_command_marks_unimplemented(self, mock_message: MagicMock) -> None:
+    def test_help_command_lists_all_commands(self, mock_message: MagicMock) -> None:
         async def _test() -> None:
             await cmd_help(mock_message)
             mock_message.answer.assert_awaited_once()
@@ -254,10 +254,11 @@ class TestBaseCommands:
             assert "/run" in text
             assert "/status" in text
             assert "/workspace" in text
-            assert "Запланировано в будущих этапах" in text
             assert "/wake" in text
             assert "/tasks" in text
             assert "/cancel" in text
+            assert "/screenshot" in text
+            assert "/result" in text
 
         asyncio.run(_test())
 
@@ -380,18 +381,16 @@ class TestRunCommandAndConfirmation:
             await cmd_run(mock_message, cmd, test_config, client, store, lock, state=mock_state)
 
             mock_message.answer.assert_awaited_once()
-            waiting_msg = mock_message.answer.return_value
-            waiting_msg.edit_text.assert_awaited_once()
-            text, kwargs = waiting_msg.edit_text.call_args[0][0], waiting_msg.edit_text.call_args[1]
+            text, kwargs = mock_message.answer.call_args[0][0], mock_message.answer.call_args[1]
 
             assert "Правильно ли агент понял задачу?" in text
-            assert "План: выполнить тестовую задачу." in text
             assert "project1" in text
             assert "Test prompt" in text
             assert "reply_markup" in kwargs
 
             # CLI MUST NOT be called yet
             client.execute.assert_not_awaited()
+            client.interpret_prompt.assert_not_awaited()
             # Operation registered in memory
             assert len(store._operations) == 1
 
@@ -718,13 +717,11 @@ class TestRunCommandAndConfirmation:
             mock_state.clear.assert_awaited_once()
             assert len(store._operations) == 1
             mock_message.answer.assert_awaited_once()
-            waiting_msg = mock_message.answer.return_value
-            waiting_msg.edit_text.assert_awaited_once()
-            text = waiting_msg.edit_text.call_args[0][0]
+            text = mock_message.answer.call_args[0][0]
             assert "Правильно ли агент понял задачу?" in text
-            assert "План: создать скрипт приветствия." in text
             assert "Создай скрипт приветствия" in text
             assert str(tmp_path) in text
+            client.interpret_prompt.assert_not_awaited()
 
         asyncio.run(_test())
 

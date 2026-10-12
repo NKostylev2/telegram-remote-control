@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import time
 from pathlib import Path
 
 from aiogram import F, Router
@@ -20,9 +21,11 @@ from aiogram.types import (
 )
 
 from remote_control.agent.agy_client import AgyClient
-from remote_control.agent.classifier import classify_task
+from remote_control.agent.classifier import TaskProfile, classify_task
+from remote_control.common.executor import TaskExecutor
 from remote_control.common.models import TaskResult, TaskStatus
 from remote_control.config import AppConfig
+from remote_control.controller.agent_dispatcher import AgentDispatcher
 from remote_control.controller.browser import (
     get_available_drives,
     get_parent_directory,
@@ -31,7 +34,11 @@ from remote_control.controller.browser import (
 )
 from remote_control.controller.confirmation import ConfirmationStatus, ConfirmationStore
 from remote_control.controller.task_queue import TaskQueue
-from remote_control.controller.task_store import DuplicateOperationError, TaskStore
+from remote_control.controller.task_store import (
+    DuplicateOperationError,
+    QueueFullError,
+    TaskStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -100,30 +107,47 @@ def _build_confirmation_keyboard(
 
 
 def _format_confirmation_text(
-    interpretation: str,
-    target_path: Path,
-    raw_prompt: str,
-    effort: str,
+    interpretation: str | None = None,
+    target_path: Path | None = None,
+    raw_prompt: str = "",
+    effort: str = "low",
     workspace_alias: str | None = None,
+    profile: TaskProfile | None = None,
 ) -> str:
-    """Format confirmation message with agent understanding and reasoning effort."""
+    """Format confirmation message with prompt, directory, category, and reasoning effort."""
     effort_labels = {
         "low": "⚡ Быстрый (low) — простое действие / сбор данных",
         "medium": "⚖️ Средний (medium) — умеренная сложность",
         "high": "🧠 Глубокий (high) — сложный анализ и кодинг",
     }
     effort_desc = effort_labels.get(effort, effort)
-    if workspace_alias and workspace_alias != str(target_path):
-        dir_display = f"{workspace_alias} ({target_path})"
+    path_display = str(target_path) if target_path is not None else "не указана"
+    if workspace_alias and workspace_alias != path_display:
+        dir_display = f"{workspace_alias} ({path_display})"
     else:
-        dir_display = str(target_path)
+        dir_display = path_display
+
+    category_info = ""
+    if profile is not None:
+        category_info = (
+            f"🏷️ <b>Категория:</b> <code>{html.escape(profile.label)}</code>\n"
+            f"<i>{html.escape(profile.description)}</i>\n\n"
+        )
+
+    interp_info = ""
+    if interpretation and interpretation.strip():
+        interp_info = (
+            "💡 <b>Понимание задачи агентом:</b>\n"
+            f"<blockquote>{html.escape(interpretation)}</blockquote>\n\n"
+        )
+
     return (
         "🤖 <b>Правильно ли агент понял задачу?</b>\n\n"
-        "💡 <b>Понимание задачи агентом:</b>\n"
-        f"<blockquote>{html.escape(interpretation)}</blockquote>\n\n"
+        f"💬 <b>Исходный запрос:</b>\n<blockquote>{html.escape(raw_prompt)}</blockquote>\n\n"
+        f"{category_info}"
+        f"{interp_info}"
         f"📁 <b>Рабочая директория:</b>\n<code>{html.escape(dir_display)}</code>\n\n"
         f"⚙️ <b>Режим рассуждения:</b> <code>{html.escape(effort_desc)}</code>\n\n"
-        f"💬 <b>Исходный запрос:</b>\n<blockquote>{html.escape(raw_prompt)}</blockquote>\n\n"
         "<i>Подтвердите запуск или нажмите кнопку режима для переключения:</i>"
     )
 
@@ -166,9 +190,9 @@ def _build_workspace_selection_keyboard(config: AppConfig) -> InlineKeyboardMark
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def _build_drives_keyboard() -> InlineKeyboardMarkup:
-    """Build keyboard listing available system drives."""
-    drives = get_available_drives()
+async def _build_drives_keyboard() -> InlineKeyboardMarkup:
+    """Build keyboard listing available system drives asynchronously."""
+    drives = await asyncio.to_thread(get_available_drives)
     drive_buttons: list[InlineKeyboardButton] = []
     rows: list[list[InlineKeyboardButton]] = []
 
@@ -370,6 +394,8 @@ async def cmd_run(
     task_lock: asyncio.Lock | None = None,
     state: FSMContext | None = None,
     task_store: TaskStore | None = None,
+    agent_dispatcher: AgentDispatcher | None = None,
+    executor: TaskExecutor | None = None,
 ) -> None:
     """Handle /run command or button click: start interactive wizard or use direct arguments."""
     # 1. If arguments are provided, use direct fast-track execution flow
@@ -409,49 +435,71 @@ async def cmd_run(
             return
 
         target_path = config.allowed_workspaces[workspace_alias]
-        if not target_path.exists() or not target_path.is_dir():
-            await message.answer(
-                f"❌ Каталог <code>{html.escape(str(target_path))}</code> не найден на диске.",
-                parse_mode="HTML",
-            )
-            return
+        mode = getattr(config, "controller_mode", "local")
+        if mode != "distributed":
+            if not target_path.exists() or not target_path.is_dir():
+                await message.answer(
+                    f"❌ Каталог <code>{html.escape(str(target_path))}</code> не найден на диске.",
+                    parse_mode="HTML",
+                )
+                return
 
-        if not agy_client.is_cli_available():
-            await message.answer("❌ Antigravity CLI не найден на компьютере. Запуск невозможен.")
-            return
+            if agy_client is not None and not agy_client.is_cli_available():
+                await message.answer(
+                    "❌ Antigravity CLI не найден на компьютере. Запуск невозможен."
+                )
+                return
+        else:
+            if agent_dispatcher is not None and agent_dispatcher.is_agent_connected():
+                if not agent_dispatcher.is_agent_ready():
+                    await message.answer(
+                        "❌ Antigravity CLI не найден на удалённом компьютере Windows. "
+                        "Запуск невозможен."
+                    )
+                    return
 
-        if task_store is None and task_lock.locked():
+        if task_store is None and task_lock is not None and task_lock.locked():
             await message.answer("⚠️ Хост занят выполнением другой задачи. Подождите её завершения.")
             return
 
-        waiting_msg = await message.answer(
-            "⏳ <i>Анализирую задачу и формирую понимание действий...</i>",
-            parse_mode="HTML",
+        t0 = time.monotonic()
+        profile = classify_task(prompt)
+        t_classify = time.monotonic() - t0
+        logger.info(
+            "Stage [classify_task] in cmd_run took %.3f ms (category=%s, effort=%s)",
+            t_classify * 1000,
+            profile.task_type,
+            profile.effort,
         )
-        interpretation = await agy_client.interpret_prompt(prompt, target_path)
 
         user_id = message.from_user.id if message.from_user else 0
         chat_id = message.chat.id
-        profile = classify_task(prompt)
         op = confirmation_store.create_operation(
             user_id=user_id,
             chat_id=chat_id,
             workspace_alias=workspace_alias,
             prompt=prompt,
             workspace_path=target_path,
-            interpretation=interpretation,
+            interpretation=profile.description,
             effort=profile.effort,
         )
 
         confirm_text = _format_confirmation_text(
-            interpretation=interpretation,
+            interpretation=profile.description,
             target_path=target_path,
             raw_prompt=prompt,
             effort=op.effort,
             workspace_alias=workspace_alias,
+            profile=profile,
         )
         keyboard = _build_confirmation_keyboard(op.operation_id, effort=op.effort)
-        await waiting_msg.edit_text(confirm_text, reply_markup=keyboard, parse_mode="HTML")
+        t_send = time.monotonic()
+        await message.answer(confirm_text, reply_markup=keyboard, parse_mode="HTML")
+        logger.info(
+            "Stage [show_confirmation] in cmd_run took %.3f ms (op_id=%s)",
+            (time.monotonic() - t_send) * 1000,
+            op.operation_id,
+        )
         return
 
     # 2. No arguments provided: launch interactive wizard
@@ -503,12 +551,13 @@ async def cb_wizard_select_workspace(
         return
 
     target_path = config.allowed_workspaces[alias]
-    if not target_path.exists() or not target_path.is_dir():
-        await callback.answer(
-            f"Каталог не найден на диске: {target_path}",
-            show_alert=True,
-        )
-        return
+    if getattr(config, "controller_mode", "local") != "distributed":
+        if not target_path.exists() or not target_path.is_dir():
+            await callback.answer(
+                f"Каталог не найден на диске: {target_path}",
+                show_alert=True,
+            )
+            return
 
     user_id = callback.from_user.id if callback.from_user else 0
     set_user_active_workspace(user_id, target_path)
@@ -535,10 +584,18 @@ async def cb_wizard_select_workspace(
 async def cb_wizard_show_drives(
     callback: CallbackQuery,
     state: FSMContext,
+    config: AppConfig | None = None,
 ) -> None:
     """Display available system drives."""
+    if config is not None and getattr(config, "controller_mode", "local") == "distributed":
+        await callback.answer(
+            "В режиме Android Controller выбирайте предустановленные папки.",
+            show_alert=True,
+        )
+        return
+
     await state.set_state(RunWizard.choosing_directory)
-    keyboard = _build_drives_keyboard()
+    keyboard = await _build_drives_keyboard()
     text = "💾 <b>Выберите системный диск:</b>"
     if isinstance(callback.message, Message):
         await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
@@ -558,7 +615,7 @@ async def cb_wizard_select_drive(
         await callback.answer(f"Диск {letter}:\\ недоступен.", show_alert=True)
         return
 
-    subdirs = list_subdirectories(drive_path)
+    subdirs = await asyncio.to_thread(list_subdirectories, drive_path)
     await state.update_data(
         current_path=str(drive_path),
         subdirs=[str(p) for p in subdirs],
@@ -596,7 +653,7 @@ async def cb_wizard_open_folder(
         await callback.answer("⚠️ Нет доступа к этой папке или она была удалена.", show_alert=True)
         return
 
-    new_subdirs = list_subdirectories(target_path)
+    new_subdirs = await asyncio.to_thread(list_subdirectories, target_path)
     await state.update_data(
         current_path=str(target_path),
         subdirs=[str(p) for p in new_subdirs],
@@ -667,7 +724,7 @@ async def cb_wizard_navigate_up(
         await cb_wizard_show_drives(callback, state)
         return
 
-    subdirs = list_subdirectories(parent)
+    subdirs = await asyncio.to_thread(list_subdirectories, parent)
     await state.update_data(
         current_path=str(parent),
         subdirs=[str(p) for p in subdirs],
@@ -752,6 +809,9 @@ async def message_received_prompt(
     agy_client: AgyClient,
     task_lock: asyncio.Lock,
     task_store: TaskStore | None = None,
+    config: AppConfig | None = None,
+    agent_dispatcher: AgentDispatcher | None = None,
+    executor: TaskExecutor | None = None,
 ) -> None:
     """Receive task prompt text from user and build final confirmation message."""
     raw_text = (message.text or "").strip()
@@ -777,12 +837,24 @@ async def message_received_prompt(
         )
         return
 
-    if not agy_client.is_cli_available():
-        await state.clear()
-        await message.answer("❌ Antigravity CLI не найден на компьютере. Запуск невозможен.")
-        return
+    if config is not None and getattr(config, "controller_mode", "local") == "distributed":
+        if agent_dispatcher is not None and agent_dispatcher.is_agent_connected():
+            if not agent_dispatcher.is_agent_ready():
+                await state.clear()
+                await message.answer(
+                    "❌ Antigravity CLI не найден на удалённом компьютере Windows. "
+                    "Запуск невозможен."
+                )
+                return
+    else:
+        if agy_client is not None and not agy_client.is_cli_available():
+            await state.clear()
+            await message.answer(
+                "❌ Antigravity CLI не найден на компьютере. Запуск невозможен."
+            )
+            return
 
-    if task_store is None and task_lock.locked():
+    if task_store is None and task_lock is not None and task_lock.locked():
         await message.answer("⚠️ Хост занят выполнением другой задачи. Пожалуйста, подождите.")
         return
 
@@ -804,32 +876,42 @@ async def message_received_prompt(
     chat_id = message.chat.id
     set_user_active_workspace(user_id, target_path)
 
-    waiting_msg = await message.answer(
-        "⏳ <i>Анализирую задачу и формирую понимание действий...</i>",
-        parse_mode="HTML",
-    )
-    interpretation = await agy_client.interpret_prompt(raw_text, target_path)
-
+    t0 = time.monotonic()
     profile = classify_task(raw_text)
+    t_classify = time.monotonic() - t0
+    logger.info(
+        "Stage [classify_task] in wizard took %.3f ms (category=%s, effort=%s)",
+        t_classify * 1000,
+        profile.task_type,
+        profile.effort,
+    )
+
     op = confirmation_store.create_operation(
         user_id=user_id,
         chat_id=chat_id,
         workspace_alias=workspace_alias,
         prompt=raw_text,
         workspace_path=target_path,
-        interpretation=interpretation,
+        interpretation=profile.description,
         effort=profile.effort,
     )
 
     confirm_text = _format_confirmation_text(
-        interpretation=interpretation,
+        interpretation=profile.description,
         target_path=target_path,
         raw_prompt=raw_text,
         effort=op.effort,
         workspace_alias=workspace_alias,
+        profile=profile,
     )
     keyboard = _build_confirmation_keyboard(op.operation_id, effort=op.effort)
-    await waiting_msg.edit_text(confirm_text, reply_markup=keyboard, parse_mode="HTML")
+    t_send = time.monotonic()
+    await message.answer(confirm_text, reply_markup=keyboard, parse_mode="HTML")
+    logger.info(
+        "Stage [show_confirmation] in wizard took %.3f ms (op_id=%s)",
+        (time.monotonic() - t_send) * 1000,
+        op.operation_id,
+    )
 
 
 @run_router.message(StateFilter(None), F.text & ~F.text.startswith("/"))
@@ -840,6 +922,8 @@ async def message_direct_prompt(
     agy_client: AgyClient,
     task_lock: asyncio.Lock,
     task_store: TaskStore | None = None,
+    agent_dispatcher: AgentDispatcher | None = None,
+    executor: TaskExecutor | None = None,
 ) -> None:
     """Handle direct text prompt messages from chat outside FSM wizard."""
     raw_text = (message.text or "").strip()
@@ -878,9 +962,20 @@ async def message_direct_prompt(
         await message.answer("❌ Текст задачи превышает лимит (максимум 2000 символов).")
         return
 
-    if not agy_client.is_cli_available():
-        await message.answer("❌ Antigravity CLI не найден на компьютере. Запуск невозможен.")
-        return
+    if getattr(config, "controller_mode", "local") == "distributed":
+        if agent_dispatcher is not None and agent_dispatcher.is_agent_connected():
+            if not agent_dispatcher.is_agent_ready():
+                await message.answer(
+                    "❌ Antigravity CLI не найден на удалённом компьютере Windows. "
+                    "Запуск невозможен."
+                )
+                return
+    else:
+        if agy_client is not None and not agy_client.is_cli_available():
+            await message.answer(
+                "❌ Antigravity CLI не найден на компьютере. Запуск невозможен."
+            )
+            return
 
     if task_store is None and task_lock.locked():
         await message.answer("⚠️ Хост занят выполнением другой задачи. Пожалуйста, подождите.")
@@ -899,7 +994,9 @@ async def message_direct_prompt(
             workspace_alias = first_alias
             set_user_active_workspace(user_id, target_path)
 
-    if target_path is None or not target_path.exists():
+    if target_path is None or (
+        getattr(config, "controller_mode", "local") != "distributed" and not target_path.exists()
+    ):
         await message.answer(
             "📁 <b>Рабочая директория не выбрана.</b>\n\n"
             "Пожалуйста, выберите папку через команду /run перед отправкой задач.",
@@ -915,31 +1012,42 @@ async def message_direct_prompt(
         if workspace_alias is None:
             workspace_alias = target_path.name or "workspace"
 
-    waiting_msg = await message.answer(
-        "⏳ <i>Анализирую задачу и формирую понимание действий...</i>",
-        parse_mode="HTML",
-    )
-    interpretation = await agy_client.interpret_prompt(raw_text, target_path)
+    t0 = time.monotonic()
     profile = classify_task(raw_text)
+    t_classify = time.monotonic() - t0
+    logger.info(
+        "Stage [classify_task] in direct_prompt took %.3f ms (category=%s, effort=%s)",
+        t_classify * 1000,
+        profile.task_type,
+        profile.effort,
+    )
+
     op = confirmation_store.create_operation(
         user_id=user_id,
         chat_id=chat_id,
         workspace_alias=workspace_alias,
         prompt=raw_text,
         workspace_path=target_path,
-        interpretation=interpretation,
+        interpretation=profile.description,
         effort=profile.effort,
     )
 
     confirm_text = _format_confirmation_text(
-        interpretation=interpretation,
+        interpretation=profile.description,
         target_path=target_path,
         raw_prompt=raw_text,
         effort=op.effort,
         workspace_alias=workspace_alias,
+        profile=profile,
     )
     keyboard = _build_confirmation_keyboard(op.operation_id, effort=op.effort)
-    await waiting_msg.edit_text(confirm_text, reply_markup=keyboard, parse_mode="HTML")
+    t_send = time.monotonic()
+    await message.answer(confirm_text, reply_markup=keyboard, parse_mode="HTML")
+    logger.info(
+        "Stage [show_confirmation] in direct_prompt took %.3f ms (op_id=%s)",
+        (time.monotonic() - t_send) * 1000,
+        op.operation_id,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -1015,6 +1123,8 @@ async def callback_confirm_run(
     task_lock: asyncio.Lock,
     task_store: TaskStore | None = None,
     task_queue: TaskQueue | None = None,
+    config: AppConfig | None = None,
+    agent_dispatcher: AgentDispatcher | None = None,
 ) -> None:
     """Handle approval of a pending /run confirmation and launch or queue CLI task."""
     if not callback.data:
@@ -1043,7 +1153,21 @@ async def callback_confirm_run(
     # 3. If persistent task store is present, persist into SQLite queue
     if task_store is not None:
         try:
+            t_enq = time.monotonic()
             task_record = await task_store.enqueue_task(op)
+            logger.info(
+                "Stage [enqueue_task] took %.3f ms (task_id=%d, op_id=%s)",
+                (time.monotonic() - t_enq) * 1000,
+                task_record.id,
+                op_id,
+            )
+        except QueueFullError as e:
+            logger.warning("Queue limit reached for op %s: %s", op_id, e)
+            await callback.answer(
+                "⚠️ Очередь задач переполнена. Подождите завершения текущих задач.",
+                show_alert=True,
+            )
+            return
         except DuplicateOperationError:
             await callback.answer("Эта задача уже находится в очереди.", show_alert=True)
             return
@@ -1066,11 +1190,23 @@ async def callback_confirm_run(
                 if pos > 1
                 else "Задача будет запущена первой."
             )
+            offline_note = ""
+            if (
+                config is not None
+                and getattr(config, "controller_mode", "local") == "distributed"
+                and agent_dispatcher is not None
+                and not agent_dispatcher.is_agent_connected()
+            ):
+                offline_note = (
+                    "\n\n⚠️ <i>Windows Agent сейчас оффлайн. "
+                    "Задача выполнится автоматически после включения ПК (/wake).</i>"
+                )
             await callback.message.edit_text(
                 f"📥 <b>Задача #{task_record.id} добавлена в очередь!</b>\n\n"
                 f"📁 Рабочая директория: <code>{ws_escaped}</code>\n"
                 f"⚙️ Режим рассуждения: <code>{html.escape(op.effort.upper())}</code>\n"
-                f"📊 {pos_str}\n\n"
+                f"📊 {pos_str}"
+                f"{offline_note}\n\n"
                 "<i>Бот уведомит вас о начале выполнения и пришлёт итоговый результат.</i>",
                 reply_markup=None,
                 parse_mode="HTML",

@@ -7,6 +7,8 @@ import json
 import logging
 import sqlite3
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,7 +18,7 @@ from remote_control.controller.confirmation import PendingConfirmation
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _MAX_RESULT_FILE_BYTES = 10 * 1024 * 1024  # 10 MB limit
 
 
@@ -34,6 +36,10 @@ class TaskNotFoundError(TaskStoreError):
 
 class TaskInvalidStateError(TaskStoreError):
     """Raised when an invalid state transition is attempted."""
+
+
+class QueueFullError(TaskStoreError):
+    """Raised when the queued tasks count exceeds max_queue_size."""
 
 
 @dataclass(frozen=True)
@@ -86,20 +92,38 @@ def _datetime_to_iso(dt: datetime | None) -> str | None:
 class TaskStore:
     """Thread-safe and async-compatible SQLite task store."""
 
-    def __init__(self, database_path: Path, results_dir: Path) -> None:
+    def __init__(self, database_path: Path, results_dir: Path, max_queue_size: int = 50) -> None:
         self.database_path = database_path.resolve()
         self.results_dir = results_dir.resolve()
+        self.max_queue_size = max_queue_size
         self._lock = threading.Lock()
 
-    def _get_connection(self) -> sqlite3.Connection:
-        """Create and configure a SQLite connection."""
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """Context manager yielding a SQLite connection and ensuring conn.close() on exit."""
         conn = sqlite3.connect(
             str(self.database_path),
             timeout=10.0,
             check_same_thread=False,
         )
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+    def _get_connection(self) -> sqlite3.Connection:
+        """Create and configure a SQLite connection (caller must close)."""
+        conn = sqlite3.connect(
+            str(self.database_path),
+            timeout=10.0,
+            check_same_thread=False,
+        )
+        conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA busy_timeout = 5000")
         conn.execute("PRAGMA synchronous = NORMAL")
@@ -111,7 +135,9 @@ class TaskStore:
             self.database_path.parent.mkdir(parents=True, exist_ok=True)
             self.results_dir.mkdir(parents=True, exist_ok=True)
 
-            with self._get_connection() as conn:
+            with self._connection() as conn:
+                # Enable WAL journal mode once at database initialization
+                conn.execute("PRAGMA journal_mode = WAL")
                 cursor = conn.cursor()
                 cursor.execute("PRAGMA user_version")
                 current_version = cursor.fetchone()[0]
@@ -148,13 +174,10 @@ class TaskStore:
                         """
                     )
                     cursor.execute(
-                        "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)"
+                        "CREATE INDEX IF NOT EXISTS idx_tasks_status_id ON tasks(status, id ASC)"
                     )
                     cursor.execute(
                         "CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id, id DESC)"
-                    )
-                    cursor.execute(
-                        "CREATE INDEX IF NOT EXISTS idx_tasks_operation_id ON tasks(operation_id)"
                     )
                     cursor.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                     conn.commit()
@@ -162,7 +185,18 @@ class TaskStore:
                     logger.info(
                         "Migrating schema from v%d to v%d...", current_version, SCHEMA_VERSION
                     )
-                    # Incremental migrations would be placed here
+                    if current_version == 1:
+                        # Migration from v1 to v2: remove redundant index, optimize queue index
+                        cursor.execute("DROP INDEX IF EXISTS idx_tasks_operation_id")
+                        cursor.execute("DROP INDEX IF EXISTS idx_tasks_status")
+                        cursor.execute(
+                            "CREATE INDEX IF NOT EXISTS idx_tasks_status_id "
+                            "ON tasks(status, id ASC)"
+                        )
+                        cursor.execute(
+                            "CREATE INDEX IF NOT EXISTS idx_tasks_user_id "
+                            "ON tasks(user_id, id DESC)"
+                        )
                     cursor.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                     conn.commit()
 
@@ -214,14 +248,30 @@ class TaskStore:
             soft_denied_tools=soft_denied_tools,
         )
 
-    def enqueue_task_sync(self, op: PendingConfirmation) -> TaskRecord:
+    def enqueue_task_sync(
+        self, op: PendingConfirmation, max_queue_size: int | None = None
+    ) -> TaskRecord:
         """Synchronously enqueue a confirmed task into SQLite."""
         with self._lock:
             now_iso = datetime.now(UTC).isoformat()
             created_iso = datetime.fromtimestamp(op.created_at, tz=UTC).isoformat()
+            effective_limit = (
+                max_queue_size if max_queue_size is not None else self.max_queue_size
+            )
 
-            with self._get_connection() as conn:
+            with self._connection() as conn:
                 cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE status = ?",
+                    (TaskStatus.QUEUED.value,),
+                )
+                queued_count = int(cursor.fetchone()[0])
+                if queued_count >= effective_limit:
+                    raise QueueFullError(
+                        f"Очередь задач заполнена ({queued_count}/{effective_limit}). "
+                        "Подождите завершения текущих задач."
+                    )
+
                 try:
                     cursor.execute(
                         """
@@ -261,14 +311,16 @@ class TaskStore:
                     raise TaskStoreError(f"Failed to fetch newly created task #{task_id}")
                 return self._row_to_record(row)
 
-    async def enqueue_task(self, op: PendingConfirmation) -> TaskRecord:
+    async def enqueue_task(
+        self, op: PendingConfirmation, max_queue_size: int | None = None
+    ) -> TaskRecord:
         """Asynchronously enqueue a confirmed task into SQLite."""
-        return await asyncio.to_thread(self.enqueue_task_sync, op)
+        return await asyncio.to_thread(self.enqueue_task_sync, op, max_queue_size)
 
     def get_task_sync(self, task_id: int) -> TaskRecord | None:
         """Synchronously retrieve a task record by ID."""
         with self._lock:
-            with self._get_connection() as conn:
+            with self._connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
                 row = cursor.fetchone()
@@ -281,7 +333,7 @@ class TaskStore:
     def get_next_queued_task_sync(self) -> TaskRecord | None:
         """Synchronously select the oldest task currently in QUEUED status."""
         with self._lock:
-            with self._get_connection() as conn:
+            with self._connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     "SELECT * FROM tasks WHERE status = ? ORDER BY id ASC LIMIT 1",
@@ -294,21 +346,19 @@ class TaskStore:
         """Asynchronously select the oldest task currently in QUEUED status."""
         return await asyncio.to_thread(self.get_next_queued_task_sync)
 
-    def mark_task_running_sync(self, task_id: int) -> bool:
-        """Atomically transition a task from QUEUED to RUNNING."""
+    def mark_task_assigned_sync(self, task_id: int) -> bool:
+        """Atomically transition a task from QUEUED to ASSIGNED."""
         with self._lock:
-            now_iso = datetime.now(UTC).isoformat()
-            with self._get_connection() as conn:
+            with self._connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
                     UPDATE tasks
-                    SET status = ?, started_at = ?
+                    SET status = ?
                     WHERE id = ? AND status = ?
                     """,
                     (
-                        TaskStatus.RUNNING.value,
-                        now_iso,
+                        TaskStatus.ASSIGNED.value,
                         task_id,
                         TaskStatus.QUEUED.value,
                     ),
@@ -316,8 +366,35 @@ class TaskStore:
                 conn.commit()
                 return cursor.rowcount > 0
 
+    async def mark_task_assigned(self, task_id: int) -> bool:
+        """Asynchronously transition a task from QUEUED to ASSIGNED."""
+        return await asyncio.to_thread(self.mark_task_assigned_sync, task_id)
+
+    def mark_task_running_sync(self, task_id: int) -> bool:
+        """Atomically transition a task from QUEUED or ASSIGNED to RUNNING."""
+        with self._lock:
+            now_iso = datetime.now(UTC).isoformat()
+            with self._connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    UPDATE tasks
+                    SET status = ?, started_at = ?
+                    WHERE id = ? AND status IN (?, ?)
+                    """,
+                    (
+                        TaskStatus.RUNNING.value,
+                        now_iso,
+                        task_id,
+                        TaskStatus.QUEUED.value,
+                        TaskStatus.ASSIGNED.value,
+                    ),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+
     async def mark_task_running(self, task_id: int) -> bool:
-        """Asynchronously transition a task from QUEUED to RUNNING."""
+        """Asynchronously transition a task from QUEUED or ASSIGNED to RUNNING."""
         return await asyncio.to_thread(self.mark_task_running_sync, task_id)
 
     def mark_task_finished_sync(
@@ -335,7 +412,7 @@ class TaskStore:
             # Store short summary directly in DB (up to 3000 chars)
             summary = result.response[:3000] if result.response else ""
 
-            with self._get_connection() as conn:
+            with self._connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
@@ -343,7 +420,7 @@ class TaskStore:
                     SET status = ?, completed_at = ?, conversation_id = ?, exit_code = ?,
                         duration_seconds = ?, result_summary = ?, result_file_path = ?,
                         error_message = ?, warnings = ?, soft_denied_tools = ?
-                    WHERE id = ? AND status = ?
+                    WHERE id = ? AND status IN (?, ?)
                     """,
                     (
                         result.status.value,
@@ -358,6 +435,7 @@ class TaskStore:
                         soft_denied_json,
                         task_id,
                         TaskStatus.RUNNING.value,
+                        TaskStatus.ASSIGNED.value,
                     ),
                 )
                 conn.commit()
@@ -379,7 +457,7 @@ class TaskStore:
     ) -> tuple[bool, str, TaskRecord | None]:
         """Cancel a queued task if owned by user_id and still in QUEUED status."""
         with self._lock:
-            with self._get_connection() as conn:
+            with self._connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
                 row = cursor.fetchone()
@@ -390,7 +468,7 @@ class TaskStore:
                     return False, f"Вы не являетесь владельцем задачи #{task_id}.", None
 
                 current_status = TaskStatus(row["status"])
-                if current_status != TaskStatus.QUEUED:
+                if current_status not in (TaskStatus.QUEUED, TaskStatus.ASSIGNED):
                     return (
                         False,
                         f"Задача #{task_id} находится в статусе {current_status.value}.",
@@ -402,7 +480,7 @@ class TaskStore:
                     """
                     UPDATE tasks
                     SET status = ?, completed_at = ?, error_message = ?
-                    WHERE id = ? AND status = ?
+                    WHERE id = ? AND status IN (?, ?)
                     """,
                     (
                         TaskStatus.CANCELED.value,
@@ -410,6 +488,7 @@ class TaskStore:
                         "Задача отменена пользователем из очереди.",
                         task_id,
                         TaskStatus.QUEUED.value,
+                        TaskStatus.ASSIGNED.value,
                     ),
                 )
                 conn.commit()
@@ -438,7 +517,7 @@ class TaskStore:
         """Mark a running task as CANCELED."""
         with self._lock:
             now_iso = datetime.now(UTC).isoformat()
-            with self._get_connection() as conn:
+            with self._connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
@@ -472,7 +551,7 @@ class TaskStore:
     ) -> list[TaskRecord]:
         """Synchronously list recent tasks for a user ordered newest first."""
         with self._lock:
-            with self._get_connection() as conn:
+            with self._connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
@@ -497,7 +576,7 @@ class TaskStore:
     def count_user_tasks_sync(self, user_id: int) -> int:
         """Synchronously count total tasks belonging to a user."""
         with self._lock:
-            with self._get_connection() as conn:
+            with self._connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     "SELECT COUNT(*) FROM tasks WHERE user_id = ?",
@@ -512,7 +591,7 @@ class TaskStore:
     def get_queue_position_sync(self, task_id: int) -> int:
         """Calculate the 1-indexed queue position of a task in QUEUED status."""
         with self._lock:
-            with self._get_connection() as conn:
+            with self._connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
@@ -538,19 +617,20 @@ class TaskStore:
         """
         with self._lock:
             now_iso = datetime.now(UTC).isoformat()
-            with self._get_connection() as conn:
+            with self._connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
                     UPDATE tasks
                     SET status = ?, completed_at = ?,
                         error_message = 'Исполнение прервано перезапуском приложения.'
-                    WHERE status = ?
+                    WHERE status IN (?, ?)
                     """,
                     (
                         TaskStatus.INTERRUPTED.value,
                         now_iso,
                         TaskStatus.RUNNING.value,
+                        TaskStatus.ASSIGNED.value,
                     ),
                 )
                 interrupted_count = cursor.rowcount
@@ -588,7 +668,7 @@ class TaskStore:
         target_path = (self.results_dir / safe_name).resolve()
 
         # Boundary check: ensure path does not escape results_dir
-        if not str(target_path).startswith(str(self.results_dir)):
+        if not target_path.is_relative_to(self.results_dir):
             raise TaskStoreError(f"Invalid path traversal attempt for task file: {safe_name}")
 
         encoded = content.encode("utf-8")
@@ -601,6 +681,10 @@ class TaskStore:
         target_path.write_bytes(encoded)
         return target_path
 
+    async def save_result_file_async(self, task_id: int, content: str) -> Path:
+        """Asynchronously save task output to a file in results_dir."""
+        return await asyncio.to_thread(self.save_result_file, task_id, content)
+
     def read_result_file(self, task_id: int) -> str | None:
         """Safely read task output file from results_dir.
 
@@ -608,8 +692,12 @@ class TaskStore:
         """
         safe_name = f"task_{task_id}.txt"
         target_path = (self.results_dir / safe_name).resolve()
-        if not str(target_path).startswith(str(self.results_dir)):
+        if not target_path.is_relative_to(self.results_dir):
             return None
         if not target_path.is_file():
             return None
         return target_path.read_text(encoding="utf-8", errors="replace")
+
+    async def read_result_file_async(self, task_id: int) -> str | None:
+        """Asynchronously read task output file from results_dir."""
+        return await asyncio.to_thread(self.read_result_file, task_id)

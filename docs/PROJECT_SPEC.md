@@ -74,7 +74,7 @@
 1. **Привязка к рабочему пространству**: Запуск задачи возможен только в явным образом выбранном рабочем пространстве из `ALLOWED_WORKSPACES` (управление через `/workspace`). Произвольные пути запрещены.
 2. **Способ запуска CLI**:
    * Запуск утилиты `agy` выполняется в пакетном неинтерактивном режиме с флагами:
-     `agy -p "<prompt>" --output-format json --print-timeout <timeout> --effort <low|medium|high>`
+     `agy -p "<prompt>" --output-format json --print-timeout <timeout> --effort <low|medium|high> [--conversation <id>] [--continue]`
    * Запуск осуществляется напрямую через API подпроцессов Windows (без промежуточного интерпретатора `cmd.exe` / `powershell.exe` и без `shell=True`).
 3. **Классификация задач и глубина рассуждений (Reasoning Effort)**:
    * Задачи автоматически анализируются и разделяются на категории (`action`, `query`, `complex`):

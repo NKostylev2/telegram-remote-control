@@ -22,6 +22,7 @@ class TaskStatus(StrEnum):
     """Lifecycle status of a task."""
 
     QUEUED = "queued"
+    ASSIGNED = "assigned"
     RUNNING = "running"
     SUCCESS = "success"
     PARTIAL_SUCCESS = "partial_success"
@@ -47,7 +48,7 @@ class TaskResult(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    task_id: UUID
+    task_id: UUID | str | int = Field(default_factory=uuid4)
     status: TaskStatus
     exit_code: int = 0
     response: str = ""

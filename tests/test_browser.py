@@ -72,6 +72,38 @@ def test_list_subdirectories_nonexistent_or_file(tmp_path: Path) -> None:
 
 
 def test_list_subdirectories_permission_error(tmp_path: Path) -> None:
-    """Test graceful handling when iterdir raises PermissionError."""
-    with patch.object(Path, "iterdir", side_effect=PermissionError("Access denied")):
+    """Test graceful handling when os.scandir raises PermissionError."""
+    with patch("os.scandir", side_effect=PermissionError("Access denied")):
         assert list_subdirectories(tmp_path) == []
+
+
+def test_list_subdirectories_empty_dir(tmp_path: Path) -> None:
+    """Test listing empty directory returns empty list."""
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    assert list_subdirectories(empty_dir) == []
+
+
+def test_list_subdirectories_many_items(tmp_path: Path) -> None:
+    """Test listing large directory with 100 subdirectories sorted properly."""
+    for i in range(100):
+        (tmp_path / f"folder_{i:03d}").mkdir()
+    (tmp_path / "file.txt").write_text("data", encoding="utf-8")
+
+    subdirs = list_subdirectories(tmp_path)
+    assert len(subdirs) == 100
+    assert subdirs[0].name == "folder_000"
+    assert subdirs[-1].name == "folder_099"
+
+
+def test_get_available_drives_windows_bitmask() -> None:
+    """Test drive bitmask decoding logic with simulated GetLogicalDrives."""
+    import types
+    # Simulate bitmask where bit 2 (C:) and bit 3 (D:) are set: 0b1100 = 12
+    fake_kernel32 = types.SimpleNamespace(GetLogicalDrives=lambda: 12)
+    fake_windll = types.SimpleNamespace(kernel32=fake_kernel32)
+    with patch("sys.platform", "win32"), patch("ctypes.windll", fake_windll, create=True):
+        drives = get_available_drives()
+        assert "C:\\" in drives
+        assert "D:\\" in drives
+        assert "A:\\" not in drives
