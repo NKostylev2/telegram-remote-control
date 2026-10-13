@@ -137,30 +137,70 @@
    ALLOWED_WORKSPACES={"backend": "M:\\dev\\my_project", "docs": "M:\\dev\\docs"}
    ```
 
-5. **Запуск Android Controller**:
-   Для предотвращения засыпания Termux активируйте wake-lock и запустите контроллер:
+5. **Автоматическая настройка автозапуска (рекомендуется)**:
+   
+   Запустите установочный скрипт для автоматической настройки автозапуска и фоновой работы:
    ```bash
-   termux-wake-lock
-   remote-control-bot
+   bash scripts/termux/setup-autostart.sh
    ```
-   Либо в фоновом режиме через `nohup`:
+   
+   Скрипт автоматически:
+   - Установит скрипт управления контроллером (`~/control-bot.sh`)
+   - Настроит автозапуск при перезагрузке телефона (через Termux:Boot)
+   - Создаст удобные псевдонимы команд (`bot-start`, `bot-stop`, `bot-status`)
+   - Проверит наличие всех необходимых компонентов
+   
+   После установки примените псевдонимы:
    ```bash
-   nohup remote-control-bot > controller.log 2>&1 &
+   source ~/.bashrc
    ```
 
-6. **(Опционально) Автозапуск при перезагрузке смартфона через Termux:Boot**:
-   Создайте файл `~/.termux/boot/start-controller.sh`:
+6. **Запуск контроллера**:
+   
+   Запустите контроллер командой:
    ```bash
-   mkdir -p ~/.termux/boot
-   cat << 'EOF' > ~/.termux/boot/start-controller.sh
-   #!/data/data/com.termux/files/usr/bin/sh
-   termux-wake-lock
-   cd ~/telegram-remote-control
-   source .venv/bin/activate
-   nohup remote-control-bot > controller.log 2>&1 &
-   EOF
-   chmod +x ~/.termux/boot/start-controller.sh
+   bot-start
+   # или: ~/control-bot.sh start
    ```
+   
+   Проверьте статус:
+   ```bash
+   bot-status
+   ```
+   
+   Просмотр логов в реальном времени:
+   ```bash
+   bot-tail
+   # или: tail -f ~/controller.log
+   ```
+
+7. **Доступные команды управления**:
+   ```bash
+   bot-start      # Запустить контроллер
+   bot-stop       # Остановить контроллер
+   bot-restart    # Перезапустить контроллер
+   bot-status     # Показать статус контроллера
+   bot-logs       # Показать последние логи
+   bot-tail       # Следить за логами в реальном времени
+   ```
+
+8. **Проверка автозапуска**:
+   
+   После настройки перезагрузите телефон. Через 2-3 минуты контроллер должен автоматически запуститься.
+   
+   Проверьте статус:
+   ```bash
+   bot-status
+   ```
+   
+   Или отправьте `/status` боту в Telegram.
+
+> **Примечание:** Для автозапуска при перезагрузке телефона необходимо:
+> 1. Установить Termux:Boot из F-Droid
+> 2. Запустить приложение Termux:Boot хотя бы один раз
+> 3. Исключить Termux и Termux:Boot из оптимизации батареи
+>
+> Подробная документация: [docs/TERMUX_AUTOSTART.md](docs/TERMUX_AUTOSTART.md)
 
 ---
 

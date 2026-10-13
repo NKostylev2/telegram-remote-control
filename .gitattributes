@@ -1,0 +1,4 @@
+# Preserve LF line endings for shell scripts across all platforms
+*.sh text eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
