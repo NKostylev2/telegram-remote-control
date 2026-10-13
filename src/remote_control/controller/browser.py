@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ntpath
 import os
 import string
 import sys
@@ -49,15 +50,26 @@ def get_available_drives() -> list[str]:
 
 def is_drive_root(path: Path | str) -> bool:
     """Check whether the given path represents a drive or filesystem root."""
-    p = Path(path).resolve()
-    return p == Path(p.anchor).resolve() or p.parent == p
+    path_str = str(path)
+    if ":" in path_str or "\\" in path_str:
+        drive, rest = ntpath.splitdrive(path_str)
+        if drive and rest in ("\\", "/", "", "\\\\"):
+            return True
+    p = Path(path)
+    return p == Path(p.anchor) or p.parent == p
 
 
 def get_parent_directory(path: Path | str) -> Path | None:
     """Return the parent directory, or None if already at drive/system root."""
-    p = Path(path).resolve()
-    if is_drive_root(p):
+    if is_drive_root(path):
         return None
+    path_str = str(path)
+    if ":" in path_str or "\\" in path_str:
+        parent_str = ntpath.dirname(path_str.rstrip("\\/"))
+        if parent_str and not parent_str.endswith("\\") and ":" in parent_str:
+            parent_str += "\\"
+        return Path(parent_str) if parent_str else None
+    p = Path(path)
     return p.parent
 
 

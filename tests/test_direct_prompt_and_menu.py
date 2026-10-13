@@ -32,7 +32,7 @@ def test_main_reply_keyboard_structure() -> None:
     """Test reply keyboard contains required 6 navigation buttons and resize/persistence flags."""
     kb = get_main_reply_keyboard()
     assert kb.resize_keyboard is True
-    assert kb.is_persistent is True
+    assert kb.is_persistent is not True
 
     button_texts = [btn.text for row in kb.keyboard for btn in row]
     assert "🚀 Запустить задачу" in button_texts

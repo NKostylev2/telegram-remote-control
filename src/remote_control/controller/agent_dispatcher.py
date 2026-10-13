@@ -13,8 +13,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from remote_control.common.models import TaskResult, TaskStatus
@@ -23,6 +25,8 @@ from remote_control.common.protocol import (
     HEARTBEAT_TIMEOUT_SECONDS,
     AgentStatusInfo,
     AgentTaskAssignment,
+    DirectoryBrowseRequest,
+    DirectoryBrowseResponse,
     HeartbeatRequest,
     HeartbeatResponse,
     PollTasksResponse,
@@ -63,6 +67,12 @@ class AgentDispatcher:
         # Screenshot request state
         self._screenshot_requested = False
         self._screenshot_future: asyncio.Future[bytes] | None = None
+
+        # Remote directory browsing state
+        self._available_drives: list[str] = []
+        self._pending_browse_req: DirectoryBrowseRequest | None = None
+        self._pending_browse_futures: dict[str, asyncio.Future[list[str]]] = {}
+        self._browse_cache: dict[str, tuple[float, list[Path]]] = {}
 
         self._on_agent_online: Callable[[], None] | None = None
         self._lock = asyncio.Lock()
@@ -115,6 +125,9 @@ class AgentDispatcher:
         now_mono = time.monotonic()
         self._last_heartbeat_monotonic = now_mono
 
+        if req.available_drives:
+            self._available_drives = req.available_drives
+
         self._current_agent = AgentStatusInfo(
             agent_id=req.agent_id,
             hostname=req.hostname,
@@ -122,6 +135,7 @@ class AgentDispatcher:
             cli_available=req.cli_available,
             cli_version=req.cli_version,
             available_workspaces=req.available_workspaces,
+            available_drives=req.available_drives,
             last_heartbeat=datetime.now(UTC),
             is_online=True,
             current_task_id=req.current_task_id,
@@ -139,11 +153,20 @@ class AgentDispatcher:
         if active_id is None and self._assigned_tasks:
             active_id = next(iter(self._assigned_tasks.keys()))
 
+        browse_id = None
+        browse_path = None
+        if self._pending_browse_req is not None:
+            browse_id = self._pending_browse_req.request_id
+            browse_path = self._pending_browse_req.path
+            self._pending_browse_req = None
+
         return HeartbeatResponse(
             acknowledged=True,
             active_task_id=active_id,
             cancel_task_ids=list(self._cancel_task_ids),
             screenshot_requested=self._screenshot_requested,
+            browse_request_id=browse_id,
+            browse_request_path=browse_path,
         )
 
     # -------------------------------------------------------------------------
@@ -355,3 +378,54 @@ class AgentDispatcher:
             return self.is_agent_ready()
         except TimeoutError:
             return False
+
+    # -------------------------------------------------------------------------
+    # Remote Directory Browsing
+    # -------------------------------------------------------------------------
+
+    def get_available_drives(self) -> list[str]:
+        """Return logical drive roots reported by connected Windows Agent."""
+        if self.is_agent_connected() and self._available_drives:
+            return self._available_drives
+        return ["C:\\"]
+
+    async def submit_browse_response(self, res: DirectoryBrowseResponse) -> bool:
+        """Receive directory browse response from Windows Agent."""
+        async with self._lock:
+            fut = self._pending_browse_futures.pop(res.request_id, None)
+            if fut is not None and not fut.done():
+                fut.set_result(res.subdirectories)
+        return True
+
+    async def request_remote_subdirectories(
+        self, path: str, timeout_seconds: float = 4.0
+    ) -> list[Path]:
+        """Request subdirectory list from Windows Agent with caching."""
+        now = time.monotonic()
+        if path in self._browse_cache:
+            cached_time, cached_subdirs = self._browse_cache[path]
+            if now - cached_time < 30.0:
+                return cached_subdirs
+
+        if not self.is_agent_connected():
+            return []
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[list[str]] = loop.create_future()
+        req_id = str(uuid.uuid4())
+
+        async with self._lock:
+            self._pending_browse_req = DirectoryBrowseRequest(request_id=req_id, path=path)
+            self._pending_browse_futures[req_id] = future
+
+        try:
+            subdirs_str = await asyncio.wait_for(future, timeout=timeout_seconds)
+            subdirs = [Path(p) for p in subdirs_str]
+            self._browse_cache[path] = (now, subdirs)
+            return subdirs
+        except TimeoutError:
+            logger.warning("Timeout browsing directory %s from Windows Agent", path)
+            return []
+        finally:
+            async with self._lock:
+                self._pending_browse_futures.pop(req_id, None)

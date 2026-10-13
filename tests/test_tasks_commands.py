@@ -9,13 +9,18 @@ from uuid import uuid4
 
 import pytest
 from aiogram.filters import CommandObject
-from aiogram.types import Chat, Message, User
+from aiogram.types import CallbackQuery, Chat, Message, User
 
 from remote_control.agent.agy_client import AgyClient
 from remote_control.common.models import TaskResult, TaskStatus
 from remote_control.controller.confirmation import ConfirmationStore
 from remote_control.controller.handlers.run import callback_confirm_run
-from remote_control.controller.handlers.tasks import cmd_cancel, cmd_result, cmd_tasks
+from remote_control.controller.handlers.tasks import (
+    cb_cancel_task,
+    cmd_cancel,
+    cmd_result,
+    cmd_tasks,
+)
 from remote_control.controller.task_queue import TaskQueue
 from remote_control.controller.task_store import TaskStore
 
@@ -375,5 +380,87 @@ class TestConfirmationQueueIntegration:
             mock_cb.answer.assert_awaited_with(
                 "Ошибка сохранения задачи в базу данных.", show_alert=True
             )
+
+        asyncio.run(_test())
+
+
+class TestTaskCancelCallback:
+    """Tests for inline cancel button callback (task:cancel:<id>)."""
+
+    def test_cancel_callback_success(self, test_store: TaskStore) -> None:
+        """Owner clicks inline Cancel button -> task is cancelled."""
+        async def _test() -> None:
+            from remote_control.controller.confirmation import PendingConfirmation
+
+            op = PendingConfirmation(
+                operation_id="op-cb-cancel",
+                user_id=111222,
+                chat_id=111222,
+                workspace_alias="control",
+                prompt="Long running task",
+                created_at=100.0,
+                expires_at=200.0,
+            )
+            task = await test_store.enqueue_task(op)
+
+            mock_queue = MagicMock(spec=TaskQueue)
+            mock_queue.cancel_task = AsyncMock(
+                return_value=(True, f"Задача #{task.id} отменена.", task)
+            )
+
+            mock_cb = MagicMock(spec=CallbackQuery)
+            mock_cb.data = f"task:cancel:{task.id}"
+            mock_cb.from_user = User(id=111222, is_bot=False, first_name="Tester")
+            mock_msg = MagicMock(spec=Message)
+            mock_msg.edit_text = AsyncMock()
+            mock_cb.message = mock_msg
+            mock_cb.answer = AsyncMock()
+
+            await cb_cancel_task(mock_cb, task_queue=mock_queue)
+
+            mock_queue.cancel_task.assert_awaited_once_with(task_id=task.id, user_id=111222)
+            mock_cb.answer.assert_awaited_once_with("Запрос на отмену отправлен!", show_alert=False)
+            mock_msg.edit_text.assert_awaited_once()
+            assert f"Задача #{task.id} отменяется" in mock_msg.edit_text.call_args[0][0]
+
+        asyncio.run(_test())
+
+    def test_cancel_callback_permission_denied(self, test_store: TaskStore) -> None:
+        """Other user clicks inline Cancel button -> rejected with alert."""
+        async def _test() -> None:
+            mock_queue = MagicMock(spec=TaskQueue)
+            mock_queue.cancel_task = AsyncMock(
+                return_value=(False, "Вы не являетесь владельцем задачи #1.", None)
+            )
+
+            mock_cb = MagicMock(spec=CallbackQuery)
+            mock_cb.data = "task:cancel:1"
+            mock_cb.from_user = User(id=999999, is_bot=False, first_name="Intruder")
+            mock_cb.answer = AsyncMock()
+
+            await cb_cancel_task(mock_cb, task_queue=mock_queue)
+
+            mock_queue.cancel_task.assert_awaited_once_with(task_id=1, user_id=999999)
+            mock_cb.answer.assert_awaited_once_with(
+                "Вы не являетесь владельцем задачи #1.", show_alert=True
+            )
+
+        asyncio.run(_test())
+
+    def test_cancel_callback_invalid_id(self) -> None:
+        """Malformed callback data is safely handled."""
+        async def _test() -> None:
+            mock_queue = MagicMock(spec=TaskQueue)
+            mock_cb = MagicMock(spec=CallbackQuery)
+            mock_cb.data = "task:cancel:not_a_number"
+            mock_cb.from_user = User(id=111222, is_bot=False, first_name="Tester")
+            mock_cb.answer = AsyncMock()
+
+            await cb_cancel_task(mock_cb, task_queue=mock_queue)
+
+            mock_cb.answer.assert_awaited_once_with(
+                "Неверный идентификатор задачи.", show_alert=True
+            )
+            mock_queue.cancel_task.assert_not_called()
 
         asyncio.run(_test())

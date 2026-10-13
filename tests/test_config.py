@@ -146,6 +146,13 @@ class TestValidationErrors:
             AppConfig(ALLOWED_WORKSPACES={"bad alias with spaces!": str(tmp_path)})
         assert "Invalid workspace alias" in str(exc_info.value)
 
+    def test_workspace_windows_absolute_path_accepted(self) -> None:
+        config = AppConfig(
+            ALLOWED_WORKSPACES={"remote_proj": "M:\\dev\\Telegram Remote Control"}
+        )
+        assert "remote_proj" in config.allowed_workspaces
+        assert str(config.allowed_workspaces["remote_proj"]) == "M:\\dev\\Telegram Remote Control"
+
     @pytest.mark.parametrize("timeout", [0, 5, 9, 86401, -100])
     def test_invalid_task_timeout(self, timeout: int) -> None:
         with pytest.raises(ValidationError) as exc_info:
@@ -199,10 +206,23 @@ class TestValidationErrors:
             AppConfig(MAX_QUEUE_SIZE=size)
         assert "MAX_QUEUE_SIZE must be between 1 and 1000" in str(exc_info.value)
 
-    def test_auto_approve_permissions_default_false(self) -> None:
+    def test_auto_approve_permissions_default_true(self) -> None:
         config = AppConfig()
-        assert config.cli_auto_approve_permissions is False
+        assert config.cli_auto_approve_permissions is True
         assert config.max_queue_size == 50
+        assert config.task_execution_timeout_seconds == 3600
+        assert config.task_progress_interval_seconds == 60
+        assert config.wake_display_on_screenshot is True
+        assert config.prevent_display_sleep_during_execution is True
+
+        config_disabled = AppConfig(CLI_AUTO_APPROVE_PERMISSIONS=False)
+        assert config_disabled.cli_auto_approve_permissions is False
+
+    @pytest.mark.parametrize("interval", [0, 4, 3601, 10000])
+    def test_invalid_task_progress_interval(self, interval: int) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            AppConfig(TASK_PROGRESS_INTERVAL_SECONDS=interval)
+        assert "TASK_PROGRESS_INTERVAL_SECONDS must be between 5 and 3600" in str(exc_info.value)
 
 
 class TestSecretProtection:

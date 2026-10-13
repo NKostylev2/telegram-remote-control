@@ -17,6 +17,7 @@ from typing import Any
 import aiohttp
 
 from remote_control.common.protocol import (
+    DirectoryBrowseResponse,
     HeartbeatRequest,
     HeartbeatResponse,
     PollTasksResponse,
@@ -156,6 +157,17 @@ class AgentHttpClient:
         headers["Content-Type"] = "image/jpeg"
         url = f"{self.base_url}{path}"
         async with session.post(url, data=image_bytes, headers=headers) as resp:
+            return resp.status == 200
+
+    async def submit_browse_response(self, res: DirectoryBrowseResponse) -> bool:
+        """Submit directory browse results to Controller."""
+        session = await self._get_session()
+        path = "/api/v1/agent/browse"
+        body_bytes = res.model_dump_json().encode("utf-8")
+        headers = self._prepare_headers("POST", path, body_bytes)
+        headers["Content-Type"] = "application/json"
+        url = f"{self.base_url}{path}"
+        async with session.post(url, data=body_bytes, headers=headers) as resp:
             return resp.status == 200
 
     async def get_controller_status(self) -> dict[str, Any]:

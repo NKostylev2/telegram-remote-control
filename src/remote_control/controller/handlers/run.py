@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import ntpath
+import os
 import time
 from pathlib import Path
 
@@ -58,7 +60,14 @@ def get_user_active_workspace(user_id: int) -> Path | None:
 
 def set_user_active_workspace(user_id: int, path: Path) -> None:
     """Update the active working directory for the user."""
-    _user_active_workspaces[user_id] = path.resolve()
+    path_str = str(path)
+    if ntpath.isabs(path_str) and os.name != "nt":
+        _user_active_workspaces[user_id] = path
+    else:
+        try:
+            _user_active_workspaces[user_id] = path.resolve()
+        except Exception:
+            _user_active_workspaces[user_id] = path
 
 
 class RunWizard(StatesGroup):
@@ -152,17 +161,31 @@ def _format_confirmation_text(
     )
 
 
-def _build_workspace_selection_keyboard(config: AppConfig) -> InlineKeyboardMarkup:
+def _build_workspace_selection_keyboard(
+    config: AppConfig,
+    agent_dispatcher: AgentDispatcher | None = None,
+) -> InlineKeyboardMarkup:
     """Build keyboard for choosing preset workspace or switching to drive picker."""
     buttons: list[list[InlineKeyboardButton]] = []
 
+    workspaces = {}
+    if (
+        config is not None
+        and getattr(config, "controller_mode", "local") == "distributed"
+        and agent_dispatcher is not None
+    ):
+        workspaces = agent_dispatcher.get_available_workspaces()
+    elif config is not None:
+        workspaces = {k: str(v) for k, v in config.allowed_workspaces.items()}
+
     # Preset workspaces
-    for alias, path in config.allowed_workspaces.items():
+    for alias, path_val in workspaces.items():
         state_icon = "🏠" if alias.lower() in ("control", "home", "default") else "📁"
+        base_name = ntpath.basename(str(path_val).rstrip("\\/")) or str(path_val)
         buttons.append(
             [
                 InlineKeyboardButton(
-                    text=f"{state_icon} {alias} ({path.name or str(path)})",
+                    text=f"{state_icon} {alias} ({base_name})",
                     callback_data=f"wz:ws:{alias}",
                 )
             ]
@@ -190,9 +213,12 @@ def _build_workspace_selection_keyboard(config: AppConfig) -> InlineKeyboardMark
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-async def _build_drives_keyboard() -> InlineKeyboardMarkup:
+async def _build_drives_keyboard(
+    drives: list[str] | None = None,
+) -> InlineKeyboardMarkup:
     """Build keyboard listing available system drives asynchronously."""
-    drives = await asyncio.to_thread(get_available_drives)
+    if drives is None:
+        drives = await asyncio.to_thread(get_available_drives)
     drive_buttons: list[InlineKeyboardButton] = []
     rows: list[list[InlineKeyboardButton]] = []
 
@@ -236,8 +262,9 @@ def _build_folder_keyboard(
     row: list[InlineKeyboardButton] = []
     for idx_offset, item in enumerate(page_items):
         actual_idx = start_idx + idx_offset
+        folder_name = ntpath.basename(str(item).rstrip("\\/")) or str(item)
         folder_btn = InlineKeyboardButton(
-            text=f"📁 {item.name[:24]}",
+            text=f"📁 {folder_name[:24]}",
             callback_data=f"wz:dir:{actual_idx}",
         )
         row.append(folder_btn)
@@ -504,7 +531,7 @@ async def cmd_run(
 
     # 2. No arguments provided: launch interactive wizard
     await state.set_state(RunWizard.choosing_directory)
-    keyboard = _build_workspace_selection_keyboard(config)
+    keyboard = _build_workspace_selection_keyboard(config, agent_dispatcher=agent_dispatcher)
 
     text = (
         "📁 <b>Выберите рабочую директорию для запуска:</b>\n\n"
@@ -524,10 +551,11 @@ async def cb_wizard_home(
     callback: CallbackQuery,
     config: AppConfig,
     state: FSMContext,
+    agent_dispatcher: AgentDispatcher | None = None,
 ) -> None:
     """Return to the initial workspace selection screen."""
     await state.set_state(RunWizard.choosing_directory)
-    keyboard = _build_workspace_selection_keyboard(config)
+    keyboard = _build_workspace_selection_keyboard(config, agent_dispatcher=agent_dispatcher)
     text = (
         "📁 <b>Выберите рабочую директорию для запуска:</b>\n\n"
         "Вы можете выбрать сохранённое рабочее пространство либо перейти "
@@ -543,15 +571,25 @@ async def cb_wizard_select_workspace(
     callback: CallbackQuery,
     config: AppConfig,
     state: FSMContext,
+    agent_dispatcher: AgentDispatcher | None = None,
 ) -> None:
     """Select a pre-configured workspace alias."""
     alias = callback.data.split(":", 2)[2]
-    if alias not in config.allowed_workspaces:
-        await callback.answer("Рабочее пространство не найдено.", show_alert=True)
-        return
+    target_path = None
+    is_distributed = getattr(config, "controller_mode", "local") == "distributed"
 
-    target_path = config.allowed_workspaces[alias]
-    if getattr(config, "controller_mode", "local") != "distributed":
+    if is_distributed and agent_dispatcher is not None:
+        agent_workspaces = agent_dispatcher.get_available_workspaces()
+        if alias in agent_workspaces:
+            target_path = Path(agent_workspaces[alias])
+
+    if target_path is None:
+        if alias not in config.allowed_workspaces:
+            await callback.answer("Рабочее пространство не найдено.", show_alert=True)
+            return
+        target_path = config.allowed_workspaces[alias]
+
+    if not is_distributed:
         if not target_path.exists() or not target_path.is_dir():
             await callback.answer(
                 f"Каталог не найден на диске: {target_path}",
@@ -585,17 +623,25 @@ async def cb_wizard_show_drives(
     callback: CallbackQuery,
     state: FSMContext,
     config: AppConfig | None = None,
+    agent_dispatcher: AgentDispatcher | None = None,
 ) -> None:
     """Display available system drives."""
-    if config is not None and getattr(config, "controller_mode", "local") == "distributed":
-        await callback.answer(
-            "В режиме Android Controller выбирайте предустановленные папки.",
-            show_alert=True,
-        )
-        return
+    is_distributed = (
+        config is not None and getattr(config, "controller_mode", "local") == "distributed"
+    )
+    if is_distributed:
+        if agent_dispatcher is not None and not agent_dispatcher.is_agent_connected():
+            await callback.answer(
+                "⚠️ Windows Agent оффлайн. Включите ПК (/wake).",
+                show_alert=True,
+            )
+            return
+        drives = agent_dispatcher.get_available_drives() if agent_dispatcher else ["C:\\"]
+    else:
+        drives = await asyncio.to_thread(get_available_drives)
 
     await state.set_state(RunWizard.choosing_directory)
-    keyboard = await _build_drives_keyboard()
+    keyboard = await _build_drives_keyboard(drives)
     text = "💾 <b>Выберите системный диск:</b>"
     if isinstance(callback.message, Message):
         await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
@@ -606,18 +652,30 @@ async def cb_wizard_show_drives(
 async def cb_wizard_select_drive(
     callback: CallbackQuery,
     state: FSMContext,
+    config: AppConfig | None = None,
+    agent_dispatcher: AgentDispatcher | None = None,
 ) -> None:
     """Open root folder of the selected drive."""
     letter = callback.data.split(":", 2)[2]
-    drive_path = Path(f"{letter}:\\")
+    drive_str = f"{letter}:\\"
+    drive_path = Path(drive_str)
+    is_distributed = (
+        config is not None and getattr(config, "controller_mode", "local") == "distributed"
+    )
 
-    if not drive_path.exists():
-        await callback.answer(f"Диск {letter}:\\ недоступен.", show_alert=True)
-        return
+    if is_distributed and agent_dispatcher is not None:
+        if not agent_dispatcher.is_agent_connected():
+            await callback.answer("⚠️ Windows Agent оффлайн.", show_alert=True)
+            return
+        subdirs = await agent_dispatcher.request_remote_subdirectories(drive_str)
+    else:
+        if not drive_path.exists():
+            await callback.answer(f"Диск {letter}:\\ недоступен.", show_alert=True)
+            return
+        subdirs = await asyncio.to_thread(list_subdirectories, drive_path)
 
-    subdirs = await asyncio.to_thread(list_subdirectories, drive_path)
     await state.update_data(
-        current_path=str(drive_path),
+        current_path=drive_str,
         subdirs=[str(p) for p in subdirs],
         page=0,
     )
@@ -625,7 +683,7 @@ async def cb_wizard_select_drive(
     keyboard = _build_folder_keyboard(subdirs, 0, drive_path)
     folders_status = f"Найдено папок: {len(subdirs)}" if subdirs else "Вложенных папок не найдено"
     text = (
-        f"📂 <b>Текущий путь:</b> <code>{html.escape(str(drive_path))}</code>\n"
+        f"📂 <b>Текущий путь:</b> <code>{html.escape(drive_str)}</code>\n"
         f"<i>{folders_status}</i>\n\n"
         "Выберите подпапку или нажмите <b>«Остаться в этой папке»</b>:"
     )
@@ -638,6 +696,8 @@ async def cb_wizard_select_drive(
 async def cb_wizard_open_folder(
     callback: CallbackQuery,
     state: FSMContext,
+    config: AppConfig | None = None,
+    agent_dispatcher: AgentDispatcher | None = None,
 ) -> None:
     """Navigate into a selected subdirectory."""
     idx = int(callback.data.split(":", 2)[2])
@@ -648,14 +708,27 @@ async def cb_wizard_open_folder(
         await callback.answer("Папка не найдена в списке.", show_alert=True)
         return
 
-    target_path = Path(subdirs_raw[idx])
-    if not target_path.exists() or not target_path.is_dir():
-        await callback.answer("⚠️ Нет доступа к этой папке или она была удалена.", show_alert=True)
-        return
+    target_path_str = subdirs_raw[idx]
+    target_path = Path(target_path_str)
+    is_distributed = (
+        config is not None and getattr(config, "controller_mode", "local") == "distributed"
+    )
 
-    new_subdirs = await asyncio.to_thread(list_subdirectories, target_path)
+    if is_distributed and agent_dispatcher is not None:
+        if not agent_dispatcher.is_agent_connected():
+            await callback.answer("⚠️ Windows Agent оффлайн.", show_alert=True)
+            return
+        new_subdirs = await agent_dispatcher.request_remote_subdirectories(target_path_str)
+    else:
+        if not target_path.exists() or not target_path.is_dir():
+            await callback.answer(
+                "⚠️ Нет доступа к этой папке или она была удалена.", show_alert=True
+            )
+            return
+        new_subdirs = await asyncio.to_thread(list_subdirectories, target_path)
+
     await state.update_data(
-        current_path=str(target_path),
+        current_path=target_path_str,
         subdirs=[str(p) for p in new_subdirs],
         page=0,
     )
@@ -665,7 +738,7 @@ async def cb_wizard_open_folder(
         f"Найдено папок: {len(new_subdirs)}" if new_subdirs else "Вложенных папок не найдено"
     )
     text = (
-        f"📂 <b>Текущий путь:</b> <code>{html.escape(str(target_path))}</code>\n"
+        f"📂 <b>Текущий путь:</b> <code>{html.escape(target_path_str)}</code>\n"
         f"<i>{folders_status}</i>\n\n"
         "Выберите подпапку или нажмите <b>«Остаться в этой папке»</b>:"
     )
@@ -708,12 +781,16 @@ async def cb_wizard_change_page(
 async def cb_wizard_navigate_up(
     callback: CallbackQuery,
     state: FSMContext,
+    config: AppConfig | None = None,
+    agent_dispatcher: AgentDispatcher | None = None,
 ) -> None:
     """Navigate up to parent directory or drives list."""
     data = await state.get_data()
     current_path_str = data.get("current_path")
     if not current_path_str:
-        await cb_wizard_show_drives(callback, state)
+        await cb_wizard_show_drives(
+            callback, state, config=config, agent_dispatcher=agent_dispatcher
+        )
         return
 
     current_path = Path(current_path_str)
@@ -721,12 +798,25 @@ async def cb_wizard_navigate_up(
 
     if parent is None or is_drive_root(current_path):
         # Back to drive selection
-        await cb_wizard_show_drives(callback, state)
+        await cb_wizard_show_drives(
+            callback, state, config=config, agent_dispatcher=agent_dispatcher
+        )
         return
 
-    subdirs = await asyncio.to_thread(list_subdirectories, parent)
+    parent_str = str(parent)
+    is_distributed = (
+        config is not None and getattr(config, "controller_mode", "local") == "distributed"
+    )
+    if is_distributed and agent_dispatcher is not None:
+        if not agent_dispatcher.is_agent_connected():
+            await callback.answer("⚠️ Windows Agent оффлайн.", show_alert=True)
+            return
+        subdirs = await agent_dispatcher.request_remote_subdirectories(parent_str)
+    else:
+        subdirs = await asyncio.to_thread(list_subdirectories, parent)
+
     await state.update_data(
-        current_path=str(parent),
+        current_path=parent_str,
         subdirs=[str(p) for p in subdirs],
         page=0,
     )
@@ -734,7 +824,7 @@ async def cb_wizard_navigate_up(
     keyboard = _build_folder_keyboard(subdirs, 0, parent)
     folders_status = f"Найдено папок: {len(subdirs)}" if subdirs else "Вложенных папок не найдено"
     text = (
-        f"📂 <b>Текущий путь:</b> <code>{html.escape(str(parent))}</code>\n"
+        f"📂 <b>Текущий путь:</b> <code>{html.escape(parent_str)}</code>\n"
         f"<i>{folders_status}</i>\n\n"
         "Выберите подпапку или нажмите <b>«Остаться в этой папке»</b>:"
     )
@@ -756,19 +846,19 @@ async def cb_wizard_select_current_folder(
         return
 
     selected_path = Path(current_path_str)
-    alias = selected_path.name or str(selected_path)
+    alias = ntpath.basename(current_path_str.rstrip("\\/")) or current_path_str
 
     user_id = callback.from_user.id if callback.from_user else 0
     set_user_active_workspace(user_id, selected_path)
 
     await state.set_state(RunWizard.waiting_for_prompt)
     await state.update_data(
-        selected_path=str(selected_path),
+        selected_path=current_path_str,
         workspace_alias=alias,
     )
 
     text = (
-        f"📁 <b>Выбрана рабочая директория:</b>\n<code>{html.escape(str(selected_path))}</code>\n\n"
+        f"📁 <b>Выбрана рабочая директория:</b>\n<code>{html.escape(current_path_str)}</code>\n\n"
         "💬 <b>Отправьте в чат текст команды/задачи для агента:</b>\n"
         "<i>(например: «Проверь git status и напиши краткий отчёт»)</i>"
     )
@@ -861,7 +951,7 @@ async def message_received_prompt(
     data = await state.get_data()
     selected_path_str = data.get("selected_path")
     workspace_alias = data.get("workspace_alias") or (
-        Path(selected_path_str).name if selected_path_str else "workspace"
+        ntpath.basename(selected_path_str.rstrip("\\/")) if selected_path_str else "workspace"
     )
     await state.clear()
 
@@ -1006,11 +1096,11 @@ async def message_direct_prompt(
 
     if workspace_alias is None:
         for alias, p in config.allowed_workspaces.items():
-            if p.resolve() == target_path.resolve():
+            if str(p).rstrip("\\/").lower() == str(target_path).rstrip("\\/").lower():
                 workspace_alias = alias
                 break
         if workspace_alias is None:
-            workspace_alias = target_path.name or "workspace"
+            workspace_alias = ntpath.basename(str(target_path).rstrip("\\/")) or "workspace"
 
     t0 = time.monotonic()
     profile = classify_task(raw_text)
@@ -1234,6 +1324,7 @@ async def callback_confirm_run(
                 workspace_alias=op.workspace_alias if not op.workspace_path else None,
                 workspace_path=op.workspace_path,
                 effort=op.effort,
+                dangerously_skip_permissions=getattr(config, "cli_auto_approve_permissions", True),
             )
         except Exception as e:
             logger.exception("Unexpected error during task execution: %s", e)
@@ -1296,14 +1387,26 @@ async def cb_post_execution_same_folder(
         if op.workspace_path
         else config.allowed_workspaces.get(op.workspace_alias)
     )
-    if target_path is None or not target_path.exists() or not target_path.is_dir():
+    is_distributed = getattr(config, "controller_mode", "local") == "distributed"
+    if not is_distributed:
+        if target_path is None or not target_path.exists() or not target_path.is_dir():
+            await callback.answer(
+                "Директория недоступна или была удалена.",
+                show_alert=True,
+            )
+            return
+    elif target_path is None:
         await callback.answer(
             "Директория недоступна или была удалена.",
             show_alert=True,
         )
         return
 
-    alias = op.workspace_alias or target_path.name or str(target_path)
+    alias = (
+        op.workspace_alias
+        or ntpath.basename(str(target_path).rstrip("\\/"))
+        or str(target_path)
+    )
     await state.set_state(RunWizard.waiting_for_prompt)
     await state.update_data(
         selected_path=str(target_path),
@@ -1326,6 +1429,7 @@ async def cb_post_execution_change_folder(
     callback: CallbackQuery,
     state: FSMContext,
     config: AppConfig,
+    agent_dispatcher: AgentDispatcher | None = None,
 ) -> None:
     """Open directory chooser wizard after task execution."""
     await state.clear()
@@ -1335,7 +1439,7 @@ async def cb_post_execution_change_folder(
         "📁 <b>Выберите рабочую директорию:</b>\n"
         "Вы можете использовать сохранённые пространства или выбрать диск."
     )
-    keyboard = _build_workspace_selection_keyboard(config)
+    keyboard = _build_workspace_selection_keyboard(config, agent_dispatcher=agent_dispatcher)
     if isinstance(callback.message, Message):
         await callback.message.answer(text, reply_markup=keyboard, parse_mode="HTML")
     await callback.answer()

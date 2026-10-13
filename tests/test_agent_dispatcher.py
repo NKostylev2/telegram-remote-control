@@ -8,6 +8,7 @@ from pathlib import Path
 
 from remote_control.common.models import TaskStatus
 from remote_control.common.protocol import (
+    DirectoryBrowseResponse,
     HeartbeatRequest,
     TaskResultSubmission,
     TaskStatusUpdateRequest,
@@ -253,5 +254,70 @@ class TestAgentDispatcherScreenshotAndWake:
 
             is_online = await dispatcher.wait_for_agent_online(timeout_seconds=0.05)
             assert is_online is False
+
+        asyncio.run(_test())
+
+
+class TestAgentDispatcherRemoteBrowse:
+    """Tests for remote filesystem browsing via Windows Agent."""
+
+    def test_drives_tracking_and_defaults(self) -> None:
+        async def _test() -> None:
+            config = AppConfig()
+            dispatcher = AgentDispatcher(config=config)
+
+            # Default when offline
+            assert dispatcher.get_available_drives() == ["C:\\"]
+
+            # Heartbeat delivers available drives
+            await dispatcher.handle_heartbeat(
+                HeartbeatRequest(
+                    agent_id="win-1",
+                    hostname="PC",
+                    cli_available=True,
+                    available_drives=["C:\\", "D:\\", "M:\\"],
+                )
+            )
+            assert dispatcher.get_available_drives() == ["C:\\", "D:\\", "M:\\"]
+
+        asyncio.run(_test())
+
+    def test_remote_subdirectories_flow_and_caching(self) -> None:
+        async def _test() -> None:
+            config = AppConfig()
+            dispatcher = AgentDispatcher(config=config)
+
+            # Bring agent online
+            await dispatcher.handle_heartbeat(
+                HeartbeatRequest(agent_id="win-1", hostname="PC", cli_available=True)
+            )
+
+            browse_coro = asyncio.create_task(
+                dispatcher.request_remote_subdirectories("M:\\dev", timeout_seconds=2.0)
+            )
+            await asyncio.sleep(0.01)
+
+            # Heartbeat receives browse request
+            hb_resp = await dispatcher.handle_heartbeat(
+                HeartbeatRequest(agent_id="win-1", hostname="PC", cli_available=True)
+            )
+            assert hb_resp.browse_request_id is not None
+            assert hb_resp.browse_request_path == "M:\\dev"
+
+            # Agent submits browse results
+            subdirs = ["M:\\dev\\Telegram Remote Control", "M:\\dev\\OtherProj"]
+            res = DirectoryBrowseResponse(
+                request_id=hb_resp.browse_request_id,
+                path="M:\\dev",
+                subdirectories=subdirs,
+            )
+            await dispatcher.submit_browse_response(res)
+
+            received = await browse_coro
+            assert [str(p) for p in received] == subdirs
+
+            # Immediate second call should return from cache without creating pending request
+            cached_received = await dispatcher.request_remote_subdirectories("M:\\dev")
+            assert [str(p) for p in cached_received] == subdirs
 
         asyncio.run(_test())

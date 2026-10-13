@@ -20,6 +20,8 @@ def clean_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         "WOL_",
         "CONTROLLER_",
         "AGENT_",
+        "WAKE_",
+        "PREVENT_",
     )
     for key in list(os.environ.keys()):
         if any(key.startswith(p) for p in prefixes):

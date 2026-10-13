@@ -11,7 +11,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from aiogram.types import Chat, Message, User
+from aiogram.fsm.context import FSMContext
+from aiogram.types import CallbackQuery, Chat, Message, User
 
 from remote_control.agent.agy_client import AgyClient
 from remote_control.common.executor import RemoteTaskExecutor
@@ -21,7 +22,11 @@ from remote_control.config import AppConfig
 from remote_control.controller.agent_dispatcher import AgentDispatcher
 from remote_control.controller.confirmation import ConfirmationStore
 from remote_control.controller.handlers.base import cmd_status, cmd_wake, cmd_workspace
-from remote_control.controller.handlers.run import cmd_run
+from remote_control.controller.handlers.run import (
+    cb_wizard_select_drive,
+    cb_wizard_show_drives,
+    cmd_run,
+)
 from remote_control.controller.handlers.screenshot import cmd_screenshot
 from remote_control.controller.task_queue import TaskQueue
 from remote_control.controller.task_store import TaskStore
@@ -195,6 +200,33 @@ def test_wake_command_distributed_waits_for_agent() -> None:
     asyncio.run(_test())
 
 
+def test_wake_command_distributed_times_out() -> None:
+    """Test /wake in distributed mode sends WoL packet and times out if agent does not connect."""
+    async def _test() -> None:
+        cfg = AppConfig(
+            ALLOWED_TELEGRAM_USERS=[111222333],
+            CONTROLLER_MODE="distributed",
+            TARGET_MAC_ADDRESS="AA:BB:CC:DD:EE:FF",
+        )
+        dispatcher = AgentDispatcher(cfg)
+        msg = _make_msg()
+        status_msg = MagicMock()
+        status_msg.edit_text = AsyncMock()
+        msg.answer.return_value = status_msg
+
+        with (
+            patch("remote_control.controller.handlers.base.send_wake_on_lan", return_value=3),
+            patch.object(dispatcher, "wait_for_agent_online", AsyncMock(return_value=False)),
+        ):
+            await cmd_wake(msg, config=cfg, agent_dispatcher=dispatcher)
+            assert status_msg.edit_text.await_count == 2
+            final_text = status_msg.edit_text.call_args[0][0]
+            assert "Таймаут ожидания пробуждения (60 сек)" in final_text
+            assert "Windows Agent не подключился к серверу" in final_text
+
+    asyncio.run(_test())
+
+
 def test_screenshot_command_distributed_mode() -> None:
     """Test /screenshot queries AgentDispatcher in distributed mode."""
     async def _test() -> None:
@@ -349,5 +381,110 @@ def test_task_queue_waits_for_agent_and_resumes(tmp_path: Path) -> None:
         await queue.stop()
         final_rec = await store.get_task(task_rec.id)
         assert final_rec is not None and final_rec.status == TaskStatus.SUCCESS
+
+    asyncio.run(_test())
+
+
+def _make_callback(data: str, user_id: int = 111222333) -> MagicMock:
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = User(id=user_id, is_bot=False, first_name="Kostya")
+    cb.data = data
+    cb.answer = AsyncMock()
+    msg = _make_msg(user_id=user_id)
+    cb.message = msg
+    return cb
+
+
+def test_wizard_show_drives_distributed_online() -> None:
+    """In distributed mode, show drives should display remote drives without blocking alert."""
+    async def _test() -> None:
+        cfg = AppConfig(
+            ALLOWED_TELEGRAM_USERS=[111222333],
+            CONTROLLER_MODE="distributed",
+        )
+        dispatcher = AgentDispatcher(cfg)
+        dispatcher._current_agent = AgentStatusInfo(
+            agent_id="test-agent",
+            hostname="DESKTOP-WIN",
+            platform="Windows-11",
+            cli_available=True,
+            available_drives=["C:\\", "D:\\", "M:\\"],
+            last_heartbeat=datetime.now(UTC),
+            is_online=True,
+        )
+        dispatcher._available_drives = ["C:\\", "D:\\", "M:\\"]
+        dispatcher._last_heartbeat_monotonic = time.monotonic()
+
+        cb = _make_callback("wz:drives")
+        state = AsyncMock(spec=FSMContext)
+
+        await cb_wizard_show_drives(cb, state=state, config=cfg, agent_dispatcher=dispatcher)
+
+        # No blocking alert
+        cb.answer.assert_awaited_once_with()
+        assert cb.message.edit_text.called
+        text, kwargs = cb.message.edit_text.call_args[0][0], cb.message.edit_text.call_args[1]
+        assert "Выберите системный диск" in text
+        markup = kwargs["reply_markup"]
+        btn_texts = [btn.text for row in markup.inline_keyboard for btn in row]
+        assert any("Диск C:\\" in t for t in btn_texts)
+        assert any("Диск M:\\" in t for t in btn_texts)
+
+    asyncio.run(_test())
+
+
+def test_wizard_show_drives_distributed_offline_alerts_user() -> None:
+    """In distributed mode, show drives when agent offline alerts user to use /wake."""
+    async def _test() -> None:
+        cfg = AppConfig(
+            ALLOWED_TELEGRAM_USERS=[111222333],
+            CONTROLLER_MODE="distributed",
+        )
+        dispatcher = AgentDispatcher(cfg)
+        cb = _make_callback("wz:drives")
+        state = AsyncMock(spec=FSMContext)
+
+        await cb_wizard_show_drives(cb, state=state, config=cfg, agent_dispatcher=dispatcher)
+
+        cb.answer.assert_awaited_once()
+        alert_text = cb.answer.call_args[0][0]
+        assert "Windows Agent оффлайн" in alert_text
+        assert "/wake" in alert_text
+
+    asyncio.run(_test())
+
+
+def test_wizard_select_drive_distributed_remote_browse() -> None:
+    """In distributed mode, selecting a drive asks AgentDispatcher for subdirectories."""
+    async def _test() -> None:
+        cfg = AppConfig(
+            ALLOWED_TELEGRAM_USERS=[111222333],
+            CONTROLLER_MODE="distributed",
+        )
+        dispatcher = AgentDispatcher(cfg)
+        dispatcher._current_agent = AgentStatusInfo(
+            agent_id="test-agent",
+            hostname="DESKTOP-WIN",
+            platform="Windows-11",
+            cli_available=True,
+            last_heartbeat=datetime.now(UTC),
+            is_online=True,
+        )
+        dispatcher._last_heartbeat_monotonic = time.monotonic()
+
+        # Mock remote subdirectories
+        mock_subdirs = [Path("M:\\dev"), Path("M:\\games")]
+        dispatcher.request_remote_subdirectories = AsyncMock(return_value=mock_subdirs)
+
+        cb = _make_callback("wz:drv:M")
+        state = AsyncMock(spec=FSMContext)
+
+        await cb_wizard_select_drive(cb, state=state, config=cfg, agent_dispatcher=dispatcher)
+
+        dispatcher.request_remote_subdirectories.assert_awaited_once_with("M:\\")
+        assert cb.message.edit_text.called
+        text = cb.message.edit_text.call_args[0][0]
+        assert "M:\\" in text
+        assert "Найдено папок: 2" in text
 
     asyncio.run(_test())

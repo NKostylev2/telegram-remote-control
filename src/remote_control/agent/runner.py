@@ -21,16 +21,18 @@ from pathlib import Path
 
 from remote_control.agent.agy_client import AgyClient
 from remote_control.agent.client import AgentHttpClient, AgentUnauthorizedError
-from remote_control.agent.screenshot import capture_desktop_screenshot
+from remote_control.agent.screenshot import capture_desktop_screenshot, set_keep_display_awake
 from remote_control.common.models import TaskResult, TaskStatus
 from remote_control.common.protocol import (
     DEFAULT_POLL_INTERVAL_SECONDS,
     AgentTaskAssignment,
+    DirectoryBrowseResponse,
     HeartbeatRequest,
     TaskResultSubmission,
     TaskStatusUpdateRequest,
 )
 from remote_control.config import AppConfig
+from remote_control.controller.browser import get_available_drives, list_subdirectories
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +86,7 @@ class AgentRunner:
         """Transmit a single heartbeat cycle and handle controller instructions."""
         cli_avail = self.agy_client.is_cli_available()
         workspaces = self.get_available_workspaces()
+        drives = get_available_drives()
         current_id = (
             self._current_task_assignment.task_id
             if self._current_task_assignment
@@ -96,6 +99,7 @@ class AgentRunner:
             platform=platform.system().lower(),
             cli_available=cli_avail,
             available_workspaces=workspaces,
+            available_drives=drives,
             current_task_id=current_id,
         )
 
@@ -112,6 +116,31 @@ class AgentRunner:
         if resp.screenshot_requested:
             logger.info("Controller requested desktop screenshot. Capturing...")
             await self._capture_and_upload_screenshot()
+
+        # Check for directory browsing request
+        if resp.browse_request_id and resp.browse_request_path:
+            logger.info("Controller requested directory listing for: %s", resp.browse_request_path)
+            await self._handle_browse_request(resp.browse_request_id, resp.browse_request_path)
+
+    async def _handle_browse_request(self, req_id: str, dir_path: str) -> None:
+        """Inspect subdirectories on Windows host and report back to Controller."""
+        try:
+            subdirs = await asyncio.to_thread(list_subdirectories, Path(dir_path))
+            subdirs_str = [str(p) for p in subdirs]
+            result = DirectoryBrowseResponse(
+                request_id=req_id,
+                path=dir_path,
+                subdirectories=subdirs_str,
+            )
+        except Exception as e:
+            logger.warning("Error browsing directory %s: %s", dir_path, e)
+            result = DirectoryBrowseResponse(
+                request_id=req_id,
+                path=dir_path,
+                subdirectories=[],
+                error=str(e),
+            )
+        await self.client.submit_browse_response(result)
 
     async def _capture_and_upload_screenshot(self) -> None:
         """Capture display and upload to Controller."""
@@ -174,6 +203,11 @@ class AgentRunner:
         # 2. Execute with cancellation safety
         t0 = time.monotonic()
         ws_path = Path(assignment.workspace_path) if assignment.workspace_path else None
+        prevent_display_sleep = getattr(
+            self.config, "prevent_display_sleep_during_execution", True
+        )
+        if prevent_display_sleep:
+            set_keep_display_awake(True)
 
         async with self._cancel_lock:
             self._current_exec_task = asyncio.create_task(
@@ -182,6 +216,7 @@ class AgentRunner:
                     workspace_alias=assignment.workspace_alias if not ws_path else None,
                     workspace_path=ws_path,
                     effort=assignment.effort,
+                    dangerously_skip_permissions=assignment.auto_approve_permissions,
                 )
             )
 
@@ -206,6 +241,8 @@ class AgentRunner:
                 duration_seconds=time.monotonic() - t0,
             )
         finally:
+            if prevent_display_sleep:
+                set_keep_display_awake(False)
             self._current_exec_task = None
             self._current_task_assignment = None
 

@@ -57,6 +57,37 @@ def test_capture_desktop_screenshot_locked_screen() -> None:
             assert len(res.image_bytes) == 0
 
 
+def test_wake_display_and_keep_awake() -> None:
+    """Test wake_display and set_keep_display_awake invoke Windows APIs."""
+    from remote_control.agent.screenshot import set_keep_display_awake, wake_display
+
+    fake_user32 = MagicMock()
+    fake_kernel32 = MagicMock()
+    fake_windll = MagicMock(user32=fake_user32, kernel32=fake_kernel32)
+
+    with patch("platform.system", return_value="Windows"):
+        with patch("ctypes.windll", fake_windll, create=True):
+            # wake_display
+            woken = wake_display(settle_seconds=0.0)
+            assert woken is True
+            fake_user32.SendNotifyMessageW.assert_called_once()
+            fake_kernel32.SetThreadExecutionState.assert_called_once()
+            assert fake_user32.mouse_event.call_count == 2
+
+            # set_keep_display_awake True
+            res_true = set_keep_display_awake(True)
+            assert res_true is True
+
+            # set_keep_display_awake False
+            res_false = set_keep_display_awake(False)
+            assert res_false is True
+
+    # Test non-windows returns False gracefully
+    with patch("platform.system", return_value="Linux"):
+        assert wake_display() is False
+        assert set_keep_display_awake(True) is False
+
+
 def test_cmd_screenshot_handler_success() -> None:
     """Test /screenshot handler sends photo when capture succeeds."""
     mock_user = User(id=111222333, is_bot=False, first_name="Kostya")

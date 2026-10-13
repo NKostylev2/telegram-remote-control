@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import time
 from typing import Any
 
 from aiogram import Bot
@@ -14,6 +15,8 @@ from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboar
 from remote_control.agent.agy_client import AgyClient
 from remote_control.common.executor import LocalTaskExecutor, TaskExecutor
 from remote_control.common.models import TaskResult, TaskStatus
+from remote_control.config import AppConfig
+from remote_control.controller.keyboards import build_task_cancel_keyboard
 from remote_control.controller.task_store import TaskRecord, TaskStore
 
 logger = logging.getLogger(__name__)
@@ -105,10 +108,12 @@ class TaskQueue:
         agy_client: AgyClient | None = None,
         bot: Bot | None = None,
         executor: TaskExecutor | None = None,
+        config: AppConfig | None = None,
     ) -> None:
         self.task_store = task_store
         self.agy_client = agy_client
         self.bot = bot
+        self.config = config
 
         if executor is not None:
             self.executor = executor
@@ -209,12 +214,14 @@ class TaskQueue:
                 logger.exception("Unexpected error in task queue worker loop: %s", e)
                 await asyncio.sleep(2.0)
 
-    async def _send_start_notification(self, task: TaskRecord, display_dir: str) -> None:
+    async def _send_start_notification(
+        self, task: TaskRecord, display_dir: str
+    ) -> Any | None:
         """Asynchronously send start notification to Telegram without blocking CLI execution."""
         if self.bot is None:
-            return
+            return None
         try:
-            await self.bot.send_message(
+            return await self.bot.send_message(
                 chat_id=task.chat_id,
                 text=(
                     f"🚀 <b>Задача #{task.id} запущена на выполнение!</b>\n\n"
@@ -222,12 +229,89 @@ class TaskQueue:
                     f"⚙️ Режим рассуждения: <code>{html.escape(task.effort.upper())}</code>\n\n"
                     "<i>Выполняется вызов Antigravity CLI, ожидайте результат...</i>"
                 ),
+                reply_markup=build_task_cancel_keyboard(task.id),
                 parse_mode="HTML",
             )
         except TelegramAPIError as e:
             logger.warning("Failed sending start notification for Task #%d: %s", task.id, e)
+            return None
         except Exception as e:
             logger.debug("Non-Telegram error sending start notification: %s", e)
+            return None
+
+    async def _run_task_with_progress_notifications(
+        self,
+        task: TaskRecord,
+        display_dir: str,
+        tracker: list[Any | None],
+    ) -> None:
+        """Send start notification and then periodically verify agent health.
+
+        Replaces status messages with updated progress while task is in progress.
+        """
+        if self.bot is None:
+            return
+
+        # 1. Start notification
+        start_msg = await self._send_start_notification(task, display_dir)
+        tracker[0] = getattr(start_msg, "message_id", None) if start_msg is not None else None
+
+        # 2. Periodic loop
+        config = self.config or getattr(getattr(self, "agy_client", None), "config", None)
+        interval = getattr(config, "task_progress_interval_seconds", 60) if config else 60
+        start_mono = time.monotonic()
+
+        while self._running:
+            await asyncio.sleep(interval)
+
+            if self._current_task_record is None or self._current_task_record.id != task.id:
+                break
+
+            # Assess executor health
+            if not self.executor.is_available():
+                status_desc = "⚠️ <b>Windows Agent не отвечает / оффлайн</b>"
+            else:
+                status_desc = "🟢 Агент активно выполняет задачу..."
+
+            elapsed_secs = int(time.monotonic() - start_mono)
+            mins = elapsed_secs // 60
+            secs = elapsed_secs % 60
+            dur_str = f"{mins} мин. {secs} сек." if mins > 0 else f"{secs} сек."
+
+            text = (
+                f"⏳ <b>Задача #{task.id} выполняется</b> (прошло {dur_str})\n\n"
+                f"📁 Директория: <code>{html.escape(display_dir)}</code>\n"
+                f"⚙️ Режим рассуждения: <code>{html.escape(task.effort.upper())}</code>\n"
+                f"Статус: {status_desc}\n\n"
+                "<i>Проверка активности: агент в процессе работы. "
+                "Вы можете отменить задачу кнопкой ниже:</i>"
+            )
+
+            try:
+                sent_msg = await self.bot.send_message(
+                    chat_id=task.chat_id,
+                    text=text,
+                    reply_markup=build_task_cancel_keyboard(task.id),
+                    parse_mode="HTML",
+                )
+                old_id = tracker[0]
+                tracker[0] = getattr(sent_msg, "message_id", None) if sent_msg is not None else None
+
+                if old_id is not None and hasattr(self.bot, "delete_message"):
+                    try:
+                        res = self.bot.delete_message(chat_id=task.chat_id, message_id=old_id)
+                        if asyncio.iscoroutine(res):
+                            await res
+                    except Exception as del_err:
+                        logger.debug(
+                            "Could not delete previous progress message %s: %s",
+                            old_id,
+                            del_err,
+                        )
+            except Exception as send_err:
+                logger.warning(
+                    "Failed sending progress update for Task #%d: %s", task.id, send_err
+                )
 
     async def _process_single_task(self, task: TaskRecord) -> None:
         """Execute a single task with state transitions and Telegram notifications."""
@@ -246,13 +330,17 @@ class TaskQueue:
 
         logger.info("Starting execution of Task #%d (User: %d)...", task.id, task.user_id)
 
-        # Non-blocking dispatch: notify Telegram user without delaying CLI start
+        # Tracking for progress notification message ID so each new minute check
+        # replaces the previous one and is cleaned up on completion.
+        tracker: list[Any | None] = [None]
+        progress_task: asyncio.Task[None] | None = None
+
         if self.bot is not None:
-            notify_task = asyncio.create_task(
-                self._send_start_notification(task, display_dir)
+            progress_task = asyncio.create_task(
+                self._run_task_with_progress_notifications(task, display_dir, tracker)
             )
-            self._pending_bg_tasks.add(notify_task)
-            notify_task.add_done_callback(self._pending_bg_tasks.discard)
+            self._pending_bg_tasks.add(progress_task)
+            progress_task.add_done_callback(self._pending_bg_tasks.discard)
 
         # Execute via configured executor inside cancellable task
         async with self._cancel_lock:
@@ -279,8 +367,23 @@ class TaskQueue:
                 error=f"Внутренняя ошибка выполнения CLI: {e}",
             )
         finally:
+            if progress_task and not progress_task.done():
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             self._current_exec_task = None
             self._current_task_record = None
+
+        # Clean up the last progress message before delivering final result
+        if self.bot is not None and tracker[0] is not None and hasattr(self.bot, "delete_message"):
+            try:
+                res = self.bot.delete_message(chat_id=task.chat_id, message_id=tracker[0])
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception as e:
+                logger.debug("Could not delete last progress message %s: %s", tracker[0], e)
 
         # Save result file if there's response content
         result_file_path = None

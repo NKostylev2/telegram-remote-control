@@ -64,9 +64,24 @@ class AppConfig(BaseSettings):
         description="Path or command name for Antigravity CLI",
     )
     task_execution_timeout_seconds: int = Field(
-        default=300,
+        default=3600,
         alias="TASK_EXECUTION_TIMEOUT_SECONDS",
         description="Maximum execution time for a CLI task in seconds",
+    )
+    task_progress_interval_seconds: int = Field(
+        default=60,
+        alias="TASK_PROGRESS_INTERVAL_SECONDS",
+        description="Interval in seconds for periodic progress checks and messages",
+    )
+    wake_display_on_screenshot: bool = Field(
+        default=True,
+        alias="WAKE_DISPLAY_ON_SCREENSHOT",
+        description="Wake display before capturing desktop screenshot on Windows",
+    )
+    prevent_display_sleep_during_execution: bool = Field(
+        default=True,
+        alias="PREVENT_DISPLAY_SLEEP_DURING_EXECUTION",
+        description="Prevent Windows display sleep while agent task is executing",
     )
     confirmation_timeout_seconds: int = Field(
         default=120,
@@ -74,7 +89,7 @@ class AppConfig(BaseSettings):
         description="Timeout in seconds for interactive confirmation of /run tasks",
     )
     cli_auto_approve_permissions: bool = Field(
-        default=False,
+        default=True,
         alias="CLI_AUTO_APPROVE_PERMISSIONS",
         description="Auto-approve tool permissions in non-interactive CLI executions",
     )
@@ -262,12 +277,18 @@ class AppConfig(BaseSettings):
                     f"forbidden traversal sequence ('..'): {path_str}"
                 )
 
-            if not os.path.isabs(path_str):
+            import ntpath
+
+            is_valid_abs = os.path.isabs(path_str) or ntpath.isabs(path_str)
+            if not is_valid_abs:
                 raise ValueError(
                     f"Workspace path for '{clean_alias}' must be an absolute path: '{path_str}'"
                 )
 
-            resolved_path = Path(path_str).resolve()
+            if os.name != "nt" and ntpath.isabs(path_str):
+                resolved_path = Path(path_str)
+            else:
+                resolved_path = Path(path_str).resolve()
             validated[clean_alias] = resolved_path
 
         return validated
@@ -278,6 +299,15 @@ class AppConfig(BaseSettings):
         if v < 10 or v > 86400:
             raise ValueError(
                 f"TASK_EXECUTION_TIMEOUT_SECONDS must be between 10 and 86400 seconds (got {v})."
+            )
+        return v
+
+    @field_validator("task_progress_interval_seconds")
+    @classmethod
+    def _validate_progress_interval(cls, v: int) -> int:
+        if v < 5 or v > 3600:
+            raise ValueError(
+                f"TASK_PROGRESS_INTERVAL_SECONDS must be between 5 and 3600 seconds (got {v})."
             )
         return v
 
@@ -397,6 +427,9 @@ class AppConfig(BaseSettings):
             "workspaces_aliases": list(self.allowed_workspaces.keys()),
             "antigravity_cli_path": self.antigravity_cli_path,
             "task_timeout_seconds": self.task_execution_timeout_seconds,
+            "task_progress_interval_seconds": self.task_progress_interval_seconds,
+            "wake_display_on_screenshot": self.wake_display_on_screenshot,
+            "prevent_display_sleep_during_execution": self.prevent_display_sleep_during_execution,
             "confirmation_timeout_seconds": self.confirmation_timeout_seconds,
             "cli_auto_approve_permissions": self.cli_auto_approve_permissions,
             "cli_reasoning_effort": self.cli_reasoning_effort,

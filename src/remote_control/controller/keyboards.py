@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 
 
 def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
@@ -23,5 +28,18 @@ def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
             ],
         ],
         resize_keyboard=True,
-        is_persistent=True,
+    )
+
+
+def build_task_cancel_keyboard(task_id: int) -> InlineKeyboardMarkup:
+    """Build inline keyboard with a Cancel button for a running or queued task."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="❌ Отменить задачу",
+                    callback_data=f"task:cancel:{task_id}",
+                )
+            ]
+        ]
     )

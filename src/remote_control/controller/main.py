@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from datetime import UTC, datetime
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramUnauthorizedError
@@ -14,12 +15,49 @@ from remote_control.agent.agy_client import AgyClient
 from remote_control.config import AppConfig, load_config
 from remote_control.controller.agent_dispatcher import AgentDispatcher
 from remote_control.controller.bot import create_bot, create_dispatcher
+from remote_control.controller.keyboards import get_main_reply_keyboard
 from remote_control.controller.server import ControllerServer
 from remote_control.controller.single_instance import SingleInstanceError, SingleInstanceLock
 from remote_control.controller.task_queue import TaskQueue
 from remote_control.controller.task_store import TaskStore
 
 logger = logging.getLogger("remote_control")
+
+
+async def send_startup_notification(bot: Bot, config: AppConfig) -> None:
+    """Send startup or restart notification to all authorized Telegram users."""
+    if not config.allowed_telegram_users:
+        return
+
+    now_str = datetime.now(UTC).strftime("%d.%m.%Y %H:%M:%S UTC")
+    mode_desc = (
+        "🌐 Распределённый (Контроллер)"
+        if config.controller_mode == "distributed"
+        else "💻 Локальный (Windows)"
+    )
+
+    msg_text = (
+        "🤖 <b>Telegram Remote Control перезапущен и готов к работе</b>\n\n"
+        f"⚙️ <b>Режим:</b> <code>{mode_desc}</code>\n"
+        f"🕒 <b>Время запуска:</b> <code>{now_str}</code>\n\n"
+        "<i>Отправьте задачу сообщением, воспользуйтесь меню или нажмите /status.</i>"
+    )
+
+    for user_id in config.allowed_telegram_users:
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=msg_text,
+                reply_markup=get_main_reply_keyboard(),
+                parse_mode="HTML",
+            )
+            logger.info("Уведомление о перезапуске отправлено пользователю %d", user_id)
+        except Exception as e:
+            logger.warning(
+                "Не удалось отправить уведомление о перезапуске пользователю %d: %s",
+                user_id,
+                e,
+            )
 
 
 async def setup_bot_commands(bot: Bot) -> None:
@@ -110,6 +148,7 @@ async def run_bot(config: AppConfig | None = None) -> None:
 
     try:
         await setup_bot_commands(bot)
+        await send_startup_notification(bot, config)
         await dp.start_polling(
             bot,
             allowed_updates=dp.resolve_used_update_types(),

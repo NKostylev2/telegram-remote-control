@@ -151,6 +151,7 @@ class TestAgentRunnerExecution:
                 workspace_alias="ws",
                 workspace_path=None,
                 effort="low",
+                dangerously_skip_permissions=True,
             )
 
             mock_client.submit_task_result.assert_awaited_once()

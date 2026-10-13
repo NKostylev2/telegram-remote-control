@@ -68,6 +68,7 @@ def test_config(tmp_path: Path) -> AppConfig:
         ALLOWED_WORKSPACES={"project1": str(ws)},
         ANTIGRAVITY_CLI_PATH=str(fake_cli),
         TASK_EXECUTION_TIMEOUT_SECONDS=60,
+        CONTROLLER_MODE="local",
     )
 
 
@@ -427,6 +428,7 @@ class TestRunCommandAndConfirmation:
                 workspace_alias="project1",
                 workspace_path=None,
                 effort="low",
+                dangerously_skip_permissions=True,
             )
             # Operation marked completed
             assert store.get_operation(op.operation_id).status == ConfirmationStatus.COMPLETED
@@ -888,5 +890,27 @@ class TestBotCreationAndStartupFailures:
             raw_token = test_config.telegram_bot_token.get_secret_value()
             for record in caplog.records:
                 assert raw_token not in record.getMessage()
+
+        asyncio.run(_test())
+
+    def test_send_startup_notification_notifies_all_allowed_users(
+        self, test_config: AppConfig
+    ) -> None:
+        async def _test() -> None:
+            from remote_control.controller.main import send_startup_notification
+
+            mock_bot = MagicMock()
+            mock_bot.send_message = AsyncMock()
+
+            await send_startup_notification(mock_bot, test_config)
+
+            assert mock_bot.send_message.await_count == len(test_config.allowed_telegram_users)
+            call_chat_ids = [
+                call.kwargs["chat_id"] for call in mock_bot.send_message.call_args_list
+            ]
+            assert 111222333 in call_chat_ids
+            assert 444555666 in call_chat_ids
+            call_text = mock_bot.send_message.call_args_list[0].kwargs["text"]
+            assert "перезапущен" in call_text
 
         asyncio.run(_test())

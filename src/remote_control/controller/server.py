@@ -19,6 +19,7 @@ from aiohttp import web
 
 from remote_control.common.protocol import (
     MAX_PAYLOAD_BYTES,
+    DirectoryBrowseResponse,
     HeartbeatRequest,
     TaskResultSubmission,
     TaskStatusUpdateRequest,
@@ -147,6 +148,16 @@ def create_controller_app(
             status=200 if success else 409,
         )
 
+    async def handle_browse(request: web.Request) -> web.Response:
+        try:
+            raw_data = await request.json()
+            req = DirectoryBrowseResponse.model_validate(raw_data)
+        except Exception as e:
+            return web.json_response({"error": f"Invalid browse payload: {e}"}, status=400)
+
+        success = await dispatcher.submit_browse_response(req)
+        return web.json_response({"acknowledged": success})
+
     async def handle_status(request: web.Request) -> web.Response:
         agent_info = dispatcher.get_agent_info()
         return web.json_response(
@@ -167,6 +178,7 @@ def create_controller_app(
     app.router.add_post("/api/v1/agent/tasks/{task_id}/status", handle_task_status)
     app.router.add_post("/api/v1/agent/tasks/{task_id}/result", handle_task_result)
     app.router.add_post("/api/v1/agent/screenshot", handle_screenshot)
+    app.router.add_post("/api/v1/agent/browse", handle_browse)
     app.router.add_get("/api/v1/status", handle_status)
 
     return app

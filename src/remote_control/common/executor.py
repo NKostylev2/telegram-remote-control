@@ -51,6 +51,17 @@ class LocalTaskExecutor(TaskExecutor):
 
     async def execute_task(self, task: TaskRecord) -> TaskResult:
         """Run task locally using AgyClient subprocess."""
+        from remote_control.agent.screenshot import set_keep_display_awake
+
+        config = getattr(self.agy_client, "config", None)
+        prevent_sleep = (
+            getattr(config, "prevent_display_sleep_during_execution", True)
+            if config is not None
+            else True
+        )
+        if prevent_sleep:
+            set_keep_display_awake(True)
+
         async with self._lock:
             self._current_task = asyncio.create_task(
                 self.agy_client.execute(
@@ -80,6 +91,8 @@ class LocalTaskExecutor(TaskExecutor):
                 error=f"Внутренняя ошибка выполнения CLI: {e}",
             )
         finally:
+            if prevent_sleep:
+                set_keep_display_awake(False)
             self._current_task = None
 
     async def cancel_task(self, task: TaskRecord) -> bool:

@@ -77,6 +77,7 @@ def create_dispatcher(
         agy_client=client,
         bot=None,
         executor=active_executor,
+        config=config,
     )
 
     if dispatcher is not None and queue is not None:

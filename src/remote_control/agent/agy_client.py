@@ -291,7 +291,7 @@ class AgyClient:
 
         if dangerously_skip_permissions is None:
             dangerously_skip_permissions = getattr(
-                self.config, "cli_auto_approve_permissions", False
+                self.config, "cli_auto_approve_permissions", True
             )
 
         if dangerously_skip_permissions:
@@ -610,6 +610,7 @@ class AgyClient:
         concise: bool = True,
         conversation_id: str | None = None,
         continue_session: bool = False,
+        dangerously_skip_permissions: bool | None = None,
     ) -> TaskResult:
         """Execute an Antigravity CLI task in the specified workspace alias or directory path.
 
@@ -628,6 +629,7 @@ class AgyClient:
                 concise=concise,
                 conversation_id=conversation_id,
                 continue_session=continue_session,
+                dangerously_skip_permissions=dangerously_skip_permissions,
             )
         except ValueError as e:
             return TaskResult(

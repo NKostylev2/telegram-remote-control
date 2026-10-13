@@ -212,6 +212,7 @@ class TestTelegramWakeHandler:
             cfg = AppConfig(
                 ALLOWED_TELEGRAM_USERS=[111222333],
                 TARGET_MAC_ADDRESS="AA:BB:CC:DD:EE:FF",
+                CONTROLLER_MODE="local",
             )
             with (
                 patch(
@@ -247,6 +248,7 @@ class TestTelegramWakeHandler:
             cfg = AppConfig(
                 ALLOWED_TELEGRAM_USERS=[111222333],
                 TARGET_MAC_ADDRESS="AA:BB:CC:DD:EE:FF",
+                CONTROLLER_MODE="local",
             )
             with (
                 patch(

@@ -137,6 +137,7 @@ class HeartbeatRequest(BaseModel):
     cli_available: bool = False
     cli_version: str | None = None
     available_workspaces: dict[str, str] = Field(default_factory=dict)
+    available_drives: list[str] = Field(default_factory=list)
     current_task_id: int | None = None
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
@@ -152,6 +153,8 @@ class HeartbeatResponse(BaseModel):
     active_task_id: int | None = None
     cancel_task_ids: list[int] = Field(default_factory=list)
     screenshot_requested: bool = False
+    browse_request_id: str | None = None
+    browse_request_path: str | None = None
 
 
 class AgentTaskAssignment(BaseModel):
@@ -166,7 +169,7 @@ class AgentTaskAssignment(BaseModel):
     prompt: str
     effort: str = "low"
     timeout_seconds: int = 300
-    auto_approve_permissions: bool = False
+    auto_approve_permissions: bool = True
     conversation_id: str | None = None
     continue_session: bool = False
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -260,6 +263,27 @@ class ScreenshotMetadata(BaseModel):
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class DirectoryBrowseRequest(BaseModel):
+    """Directory inspection instruction sent by Controller."""
+
+    model_config = ConfigDict(frozen=True)
+
+    request_id: str
+    path: str
+
+
+class DirectoryBrowseResponse(BaseModel):
+    """Directory listing result submitted by Windows Agent."""
+
+    model_config = ConfigDict(frozen=True)
+
+    protocol_version: str = PROTOCOL_VERSION
+    request_id: str
+    path: str
+    subdirectories: list[str] = Field(default_factory=list)
+    error: str | None = None
+
+
 class AgentStatusInfo(BaseModel):
     """Snapshot of connected agent status maintained in memory by Controller."""
 
@@ -269,6 +293,7 @@ class AgentStatusInfo(BaseModel):
     cli_available: bool
     cli_version: str | None = None
     available_workspaces: dict[str, str] = Field(default_factory=dict)
+    available_drives: list[str] = Field(default_factory=list)
     last_heartbeat: datetime
     is_online: bool
     current_task_id: int | None = None

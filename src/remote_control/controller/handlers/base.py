@@ -225,18 +225,18 @@ async def cmd_wake(
                 parse_mode="HTML",
             )
             return
-
-    # Check if host port is already online
-    is_already_online = await check_host_availability(
-        config.controller_host, config.controller_port, timeout=1.0
-    )
-    if is_already_online:
-        await message.answer(
-            "🟢 <b>Целевой компьютер уже включён и доступен!</b>\n"
-            f"Хост <code>{escaped_host}:{config.controller_port}</code> онлайн.",
-            parse_mode="HTML",
+    else:
+        # In local mode, check if host port is already online
+        is_already_online = await check_host_availability(
+            config.controller_host, config.controller_port, timeout=1.0
         )
-        return
+        if is_already_online:
+            await message.answer(
+                "🟢 <b>Целевой компьютер уже включён и доступен!</b>\n"
+                f"Хост <code>{escaped_host}:{config.controller_port}</code> онлайн.",
+                parse_mode="HTML",
+            )
+            return
 
     status_msg = await message.answer(
         f"📡 <b>Отправляю Wake-on-LAN Magic Packet</b> на MAC: <code>{escaped_mac}</code>...",
@@ -256,7 +256,7 @@ async def cmd_wake(
             parse_mode="HTML",
         )
 
-        # In distributed mode, wait for agent online event with fallback to TCP
+        # In distributed mode, wait for agent online event with timeout
         if mode == "distributed" and agent_dispatcher is not None:
             agent_online = await agent_dispatcher.wait_for_agent_online(timeout_seconds=60.0)
             if agent_online:
@@ -266,12 +266,22 @@ async def cmd_wake(
                     parse_mode="HTML",
                 )
                 return
+            else:
+                await status_msg.edit_text(
+                    "⏱️ <b>Таймаут ожидания пробуждения (60 сек).</b>\n\n"
+                    f"Magic Packet был отправлен на <code>{escaped_mac}</code>, "
+                    "но Windows Agent не подключился к серверу за 60 секунд.\n"
+                    "<i>Проверьте настройки сетевой карты, BIOS/UEFI "
+                    "(Wake on Magic Packet / ErP Ready) и автозапуск служб.</i>",
+                    parse_mode="HTML",
+                )
+                return
 
-        # Wait for host with non-blocking polling
+        # Local mode: Wait for host with non-blocking polling
         is_online = await wait_for_host(
             config.controller_host,
             config.controller_port,
-            max_wait_seconds=60.0 if mode != "distributed" else 5.0,
+            max_wait_seconds=60.0,
             initial_delay=1.0,
             check_interval=2.0,
         )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
@@ -47,6 +48,7 @@ def mock_bot() -> MagicMock:
     bot = MagicMock(spec=Bot)
     bot.send_message = AsyncMock()
     bot.send_document = AsyncMock()
+    bot.delete_message = AsyncMock()
     return bot
 
 
@@ -410,6 +412,128 @@ class TestTaskQueueErrorHandling:
             final_task = await test_store.get_task(task.id)
             assert final_task is not None
             assert final_task.status == TaskStatus.SUCCESS
+
+        asyncio.run(_test())
+
+
+class TestTaskQueueProgressNotifications:
+    """Tests for minute-by-minute progress checks, message replacements, and cancel button."""
+
+    def test_progress_notifications_sends_periodic_updates_and_deletes_previous(
+        self, test_store: TaskStore, mock_client: MagicMock, mock_bot: MagicMock
+    ) -> None:
+        """Periodic loop sends status update, attaches Cancel button, and deletes previous msg."""
+        async def _test() -> None:
+            msg_counter = 100
+            sent_messages = []
+
+            async def fake_send_message(*args: object, **kwargs: object) -> MagicMock:
+                nonlocal msg_counter
+                msg_counter += 1
+                msg = MagicMock()
+                msg.message_id = msg_counter
+                sent_messages.append((args, kwargs, msg_counter))
+                return msg
+
+            mock_bot.send_message.side_effect = fake_send_message
+            mock_bot.delete_message = AsyncMock()
+
+            # Simulate task taking ~0.25 seconds
+            async def slow_execute(*args: object, **kwargs: object) -> TaskResult:
+                await asyncio.sleep(0.25)
+                return TaskResult(
+                    task_id=uuid4(),
+                    status=TaskStatus.SUCCESS,
+                    response="Completed smoothly.",
+                    duration_seconds=0.25,
+                )
+
+            mock_client.execute.side_effect = slow_execute
+
+            task = await test_store.enqueue_task(_make_op("op-prog-1", "Progress check task"))
+            fake_config = MagicMock(task_progress_interval_seconds=0.05)
+            queue = TaskQueue(
+                task_store=test_store,
+                agy_client=mock_client,
+                bot=mock_bot,
+                config=fake_config,
+            )
+
+            queue.start()
+
+            # Wait for task to finish
+            for _ in range(30):
+                r = await test_store.get_task(task.id)
+                if r and r.status == TaskStatus.SUCCESS:
+                    break
+                await asyncio.sleep(0.05)
+
+            await queue.stop()
+
+            # Verify send_message was called at least for start notification and result
+            assert mock_bot.send_message.call_count >= 2
+
+            # Check that initial start notification had the cancel button with task ID
+            first_call_kwargs = sent_messages[0][1]
+            reply_markup = first_call_kwargs.get("reply_markup")
+            assert reply_markup is not None
+            buttons = [b for row in reply_markup.inline_keyboard for b in row]
+            assert any(f"task:cancel:{task.id}" in getattr(b, "callback_data", "") for b in buttons)
+
+            # Check that delete_message was invoked during replacement/cleanup
+            assert mock_bot.delete_message.await_count >= 1
+
+        asyncio.run(_test())
+
+    def test_progress_loop_warns_when_executor_offline(
+        self, test_store: TaskStore, mock_bot: MagicMock
+    ) -> None:
+        """Progress message displays warning if Windows Agent is unreachable."""
+        async def _test() -> None:
+            from remote_control.common.executor import TaskExecutor
+
+            offline_executor = MagicMock(spec=TaskExecutor)
+            offline_executor.is_available.return_value = False
+
+            task = await test_store.enqueue_task(_make_op("op-prog-offline", "Offline task"))
+            fake_config = MagicMock(task_progress_interval_seconds=0.01)
+            queue = TaskQueue(
+                task_store=test_store,
+                executor=offline_executor,
+                bot=mock_bot,
+                config=fake_config,
+            )
+
+            tracker: list[Any] = [None]
+            queue._running = True
+            queue._current_task_record = task
+
+            fake_msg = MagicMock()
+            fake_msg.message_id = 105
+            mock_bot.send_message = AsyncMock(return_value=fake_msg)
+
+            # Launch progress notification loop
+            prog_task = asyncio.create_task(
+                queue._run_task_with_progress_notifications(task, "C:\\work", tracker)
+            )
+
+            # Give it time to tick at least once
+            await asyncio.sleep(0.05)
+
+            # Stop loop
+            queue._running = False
+            prog_task.cancel()
+            try:
+                await prog_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+            # Verify that at least one progress message was sent and contained offline warning
+            calls = mock_bot.send_message.call_args_list
+            assert len(calls) >= 2
+            # Second call is the periodic progress update
+            prog_text = calls[1].kwargs.get("text") or calls[1].args[0]
+            assert "Windows Agent не отвечает / оффлайн" in prog_text
 
         asyncio.run(_test())
 

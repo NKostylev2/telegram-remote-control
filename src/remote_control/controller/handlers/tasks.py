@@ -6,7 +6,7 @@ import html
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BufferedInputFile, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from remote_control.common.models import TaskStatus
 from remote_control.controller.keyboards import get_main_reply_keyboard
@@ -123,6 +123,39 @@ async def cmd_cancel(
         await message.answer(f"✅ {msg}", parse_mode="HTML")
     else:
         await message.answer(f"⚠️ {msg}", parse_mode="HTML")
+
+
+@tasks_router.callback_query(F.data.startswith("task:cancel:"))
+async def cb_cancel_task(
+    callback: CallbackQuery,
+    task_queue: TaskQueue,
+) -> None:
+    """Handle inline cancellation button click for a task."""
+    if not callback.data:
+        return
+
+    try:
+        task_id = int(callback.data.split(":", 2)[2])
+    except (IndexError, ValueError):
+        await callback.answer("Неверный идентификатор задачи.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id if callback.from_user else 0
+    success, msg, _task = await task_queue.cancel_task(task_id=task_id, user_id=user_id)
+
+    if success:
+        await callback.answer("Запрос на отмену отправлен!", show_alert=False)
+        if callback.message and isinstance(callback.message, Message):
+            try:
+                await callback.message.edit_text(
+                    f"⚪ <b>Задача #{task_id} отменяется...</b>\n\n<i>{html.escape(msg)}</i>",
+                    reply_markup=None,
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+    else:
+        await callback.answer(msg, show_alert=True)
 
 
 @tasks_router.message(Command("result"))

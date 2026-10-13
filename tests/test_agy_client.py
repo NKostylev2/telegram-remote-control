@@ -102,7 +102,7 @@ class TestCommandArgsConstruction:
         client = AgyClient(sample_config)
         args = client.build_command_args(prompt="Summarize repo")
 
-        # By default, dangerous auto-approval is disabled
+        # Auto-approval of permissions is enabled by default to allow command execution
         expected = [
             str(mock_cli_path.resolve()),
             "--print",
@@ -110,10 +110,17 @@ class TestCommandArgsConstruction:
             "--output-format",
             "json",
             "--disable-slash-commands",
+            "--dangerously-skip-permissions",
             "--effort",
             "low",
         ]
         assert args == expected
+
+        # Can be explicitly disabled
+        args_disabled = client.build_command_args(
+            prompt="Summarize repo", dangerously_skip_permissions=False
+        )
+        assert "--dangerously-skip-permissions" not in args_disabled
 
     def test_build_args_with_auto_approve_permissions(
         self, sample_config: AppConfig, mock_cli_path: Path
@@ -641,13 +648,14 @@ class TestSpecialCharactersAndSecurity:
         assert args[print_idx + 1] == special_prompt.strip()
 
         # No shell characters should cause multiple split arguments
-        # Excludes --dangerously-skip-permissions by default, includes --effort low
-        assert len(args) == 8
+        # Includes --dangerously-skip-permissions by default, includes --effort low
+        assert len(args) == 9
         assert args[3] == "--output-format"
         assert args[4] == "json"
         assert args[5] == "--disable-slash-commands"
-        assert args[6] == "--effort"
-        assert args[7] == "low"
+        assert args[6] == "--dangerously-skip-permissions"
+        assert args[7] == "--effort"
+        assert args[8] == "low"
 
     def test_build_command_args_with_conversation_and_continue(
         self, sample_config: AppConfig

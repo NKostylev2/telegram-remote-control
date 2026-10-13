@@ -165,7 +165,7 @@ class TaskRequest(BaseModel):
     prompt: str
     effort: str = "medium"
     timeout_seconds: float = 300.0
-    auto_approve_permissions: bool = False
+    auto_approve_permissions: bool = True
     conversation_id: str | None = None
     continue_session: bool = False
 
