@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Запуск сопутствующих сервисов (AG, Nova) и компонентов Telegram Remote Control на Windows.
 .DESCRIPTION
@@ -21,7 +21,9 @@ param(
     [ValidateSet("auto", "agent", "controller", "bot", "both")]
     [string]$Mode = "auto",
 
-    [int]$DelaySeconds = 5
+    [int]$DelaySeconds = 5,
+
+    [switch]$RequireWol
 )
 
 $ErrorActionPreference = "Continue"
@@ -38,6 +40,54 @@ function Write-Log([string]$Message, [string]$Level = "INFO") {
 }
 
 Write-Log "=== Запуск сервисов Telegram Remote Control ==="
+
+# 0. Проверка условия Wake-on-LAN (если указан параметр -RequireWol)
+if ($RequireWol) {
+    Write-Log "Режим запуска строго по сети: Проверка запроса Wake-on-LAN от Контроллера..."
+
+    $controllerHost = "192.168.0.20"
+    $controllerPort = 8080
+
+    if (Test-Path $EnvFile) {
+        $envLines = Get-Content $EnvFile
+        foreach ($line in $envLines) {
+            if ($line -match "^\s*CONTROLLER_HOST\s*=\s*(.+)") {
+                $controllerHost = $matches[1].Trim()
+            }
+            if ($line -match "^\s*CONTROLLER_PORT\s*=\s*(\d+)") {
+                $controllerPort = [int]$matches[1].Trim()
+            }
+        }
+    }
+
+    $wakeStatusUrl = "http://" + $controllerHost + ":" + $controllerPort + "/api/v1/wake/status?consume=true&window=300"
+    $targetAddr = "$controllerHost" + ":" + "$controllerPort"
+    $wakeConfirmed = $false
+
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        try {
+            $resp = Invoke-RestMethod -Uri $wakeStatusUrl -Method Get -TimeoutSec 3 -ErrorAction Stop
+            if ($resp -and $resp.wake_requested -eq $true) {
+                $wakeConfirmed = $true
+                break
+            } else {
+                Write-Log -Message "Контроллер ответил: Запрос Wake-on-LAN не зафиксирован (ПК запущен вручную)." -Level "INFO"
+                break
+            }
+        } catch {
+            Write-Log -Message "Попытка $attempt/5: Ожидание связи с Контроллером ${targetAddr}..." -Level "DEBUG"
+            Start-Sleep -Seconds 2
+        }
+    }
+
+    if (-not $wakeConfirmed) {
+        Write-Log -Message "Компьютер включен вручную (обычный запуск). Фоновые службы Remote Control пропущены." -Level "INFO"
+        Write-Log -Message "=== Завершение работы без запуска сервисов ===" -Level "INFO"
+        exit 0
+    }
+
+    Write-Log -Message "Запрос Wake-on-LAN подтвержден Контроллером! Выполняется запуск фоновых сервисов..." -Level "INFO"
+}
 
 # 1. Запуск AG_2.19.1.exe
 if (Test-Path $AgPath) {

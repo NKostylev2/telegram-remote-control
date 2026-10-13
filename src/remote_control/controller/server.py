@@ -38,8 +38,8 @@ def create_auth_middleware(config: AppConfig) -> web.middleware:
         request: web.Request,
         handler: Any,
     ) -> web.StreamResponse:
-        # Public healthcheck endpoint does not require credentials
-        if request.path == "/api/v1/status":
+        # Public healthcheck and wake status endpoints do not require credentials
+        if request.path in ("/api/v1/status", "/api/v1/wake/status"):
             return await handler(request)
 
         secret_wrapper = config.agent_auth_secret
@@ -169,6 +169,24 @@ def create_controller_app(
             }
         )
 
+    async def handle_wake_status(request: web.Request) -> web.Response:
+        consume_param = request.query.get("consume", "true").lower() in ("true", "1", "yes")
+        try:
+            window_param = float(request.query.get("window", "300.0"))
+        except ValueError:
+            window_param = 300.0
+
+        was_woken = dispatcher.check_and_consume_wake_request(
+            window_seconds=window_param,
+            consume=consume_param,
+        )
+        return web.json_response(
+            {
+                "wake_requested": was_woken,
+                "consumed": consume_param if was_woken else False,
+            }
+        )
+
     # -------------------------------------------------------------------------
     # Route Registration
     # -------------------------------------------------------------------------
@@ -180,6 +198,7 @@ def create_controller_app(
     app.router.add_post("/api/v1/agent/screenshot", handle_screenshot)
     app.router.add_post("/api/v1/agent/browse", handle_browse)
     app.router.add_get("/api/v1/status", handle_status)
+    app.router.add_get("/api/v1/wake/status", handle_wake_status)
 
     return app
 

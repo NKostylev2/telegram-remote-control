@@ -202,3 +202,43 @@ class TestControllerServerEndpoints:
                 assert data["agent_connected"] is False
 
         asyncio.run(_test())
+
+    def test_wake_status_endpoint_lifecycle(self) -> None:
+        async def _test() -> None:
+            config = AppConfig(AGENT_AUTH_SECRET="secret_for_testing_purposes_12345")
+            dispatcher = AgentDispatcher(config)
+            app = create_controller_app(config, dispatcher)
+
+            async with TestClient(TestServer(app)) as client:
+                # 1. Unauthenticated request allowed, wake_requested is False initially
+                resp = await client.get("/api/v1/wake/status")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["wake_requested"] is False
+                assert data["consumed"] is False
+
+                # 2. Record wake request in dispatcher
+                dispatcher.record_wake_request()
+
+                # 3. Query without consuming
+                resp = await client.get("/api/v1/wake/status?consume=false")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["wake_requested"] is True
+                assert data["consumed"] is False
+
+                # 4. Query with consume=true
+                resp = await client.get("/api/v1/wake/status?consume=true")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["wake_requested"] is True
+                assert data["consumed"] is True
+
+                # 5. Subsequent query shows false
+                resp = await client.get("/api/v1/wake/status")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["wake_requested"] is False
+
+        asyncio.run(_test())
+

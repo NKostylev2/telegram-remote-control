@@ -249,6 +249,9 @@ async def cmd_wake(
             broadcast_ip=config.wol_broadcast_ip,
             port=config.wol_port,
         )
+        if agent_dispatcher is not None:
+            agent_dispatcher.record_wake_request()
+
         await status_msg.edit_text(
             f"📡 <b>Wake-on-LAN Magic Packet отправлен</b> "
             f"({sent} шт. на <code>{escaped_mac}</code>).\n"

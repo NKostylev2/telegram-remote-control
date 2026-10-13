@@ -74,12 +74,37 @@ class AgentDispatcher:
         self._pending_browse_futures: dict[str, asyncio.Future[list[str]]] = {}
         self._browse_cache: dict[str, tuple[float, list[Path]]] = {}
 
+        self._last_wake_monotonic: float | None = None
         self._on_agent_online: Callable[[], None] | None = None
         self._lock = asyncio.Lock()
 
     def set_on_agent_online(self, callback: Callable[[], None]) -> None:
         """Register a callback invoked whenever the Windows Agent checks in online."""
         self._on_agent_online = callback
+
+    def record_wake_request(self) -> None:
+        """Record that a Wake-on-LAN request was sent from the Controller."""
+        self._last_wake_monotonic = time.monotonic()
+        logger.info("Recorded Wake-on-LAN request event.")
+
+    def check_and_consume_wake_request(
+        self, window_seconds: float = 300.0, consume: bool = True
+    ) -> bool:
+        """Check if a Wake-on-LAN request was recorded within window_seconds.
+
+        If consume is True, resets the recorded timestamp upon match.
+        """
+        if self._last_wake_monotonic is None:
+            return False
+        elapsed = time.monotonic() - self._last_wake_monotonic
+        if elapsed <= window_seconds:
+            if consume:
+                self._last_wake_monotonic = None
+                logger.info(
+                    "Wake-on-LAN request consumed by waking host (elapsed %.1f s).", elapsed
+                )
+            return True
+        return False
 
     # -------------------------------------------------------------------------
     # Agent State Inspection

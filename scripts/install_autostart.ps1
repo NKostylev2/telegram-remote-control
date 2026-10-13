@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Установка или удаление автозапуска Telegram Remote Control при входе в Windows.
 .DESCRIPTION
@@ -44,10 +44,11 @@ if (-not (Test-Path $BatPath)) {
 try {
     $WshShell = New-Object -ComObject WScript.Shell
     $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
-    $Shortcut.TargetPath = $BatPath
+    $shortcutArgs = @("-RequireWol")
     if ($Mode -ne "auto") {
-        $Shortcut.Arguments = "-Mode $Mode"
+        $shortcutArgs += "-Mode $Mode"
     }
+    $Shortcut.Arguments = $shortcutArgs -join " "
     $Shortcut.WorkingDirectory = $ProjectRoot
     $Shortcut.Description = "Telegram Remote Control Service Launcher"
     $Shortcut.WindowStyle = 7 # 7 = Minimized (не мешает при входе в систему)

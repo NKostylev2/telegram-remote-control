@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from remote_control.common.models import TaskStatus
 from remote_control.common.protocol import (
@@ -321,3 +322,36 @@ class TestAgentDispatcherRemoteBrowse:
             assert [str(p) for p in cached_received] == subdirs
 
         asyncio.run(_test())
+
+    def test_wake_request_lifecycle(self) -> None:
+        config = AppConfig()
+        dispatcher = AgentDispatcher(config=config)
+
+        # Initially no wake request recorded
+        assert dispatcher.check_and_consume_wake_request() is False
+
+        # Record wake request
+        dispatcher.record_wake_request()
+
+        # Check without consuming
+        assert dispatcher.check_and_consume_wake_request(consume=False) is True
+        assert dispatcher.check_and_consume_wake_request(consume=False) is True
+
+        # Check and consume
+        assert dispatcher.check_and_consume_wake_request(consume=True) is True
+
+        # Should now be consumed (False)
+        assert dispatcher.check_and_consume_wake_request() is False
+
+    def test_wake_request_expiration(self) -> None:
+        config = AppConfig()
+        dispatcher = AgentDispatcher(config=config)
+
+        dispatcher.record_wake_request()
+        # Mock older monotonic time
+        dispatcher._last_wake_monotonic = 100.0
+
+        with patch("time.monotonic", return_value=500.0):
+            # Window 300s, elapsed 400s -> expired
+            assert dispatcher.check_and_consume_wake_request(window_seconds=300.0) is False
+
