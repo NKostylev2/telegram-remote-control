@@ -129,7 +129,19 @@ async def run_bot(config: AppConfig | None = None) -> None:
     if config.controller_mode == "distributed":
         agent_dispatcher = AgentDispatcher(config)
         server = ControllerServer(config, agent_dispatcher)
-        await server.start()
+        try:
+            await server.start()
+        except OSError as e:
+            logger.error(
+                "Не удалось запустить HTTP API Controller на %s:%d: %s. Возможно, порт занят "
+                "прежним экземпляром контроллера (проверьте `control-bot.sh status`) или "
+                "CONTROLLER_HOST указывает на адрес, которого нет на этом устройстве.",
+                config.controller_host,
+                config.controller_port,
+                e,
+            )
+            instance_lock.release()
+            sys.exit(1)
 
     # 4. Create bot, client, queue worker, and dispatcher
     bot = create_bot(config)
@@ -181,6 +193,9 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    # The agent polls the Controller about twice per second; logging every request at INFO
+    # grows controller.log by tens of MB per day while the PC is on. Keep only problems.
+    logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
     try:
         asyncio.run(run_bot())
     except SystemExit:

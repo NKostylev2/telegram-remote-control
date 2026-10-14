@@ -6,6 +6,29 @@ PIDFILE="$HOME/.termux/controller.pid"
 LOGFILE="$HOME/controller.log"
 BOOT_LOG="$HOME/boot.log"
 
+# Определяет, чем является процесс из PID-файла: supervisor | legacy | none.
+# После перезагрузки Android старый PID из файла может принадлежать совсем другому
+# процессу, поэтому одного `kill -0` недостаточно: сверяем командную строку.
+#   supervisor - run-controller-loop.sh (текущая схема, перезапускает контроллер сам)
+#   legacy     - контроллер, запущенный старой версией скрипта без supervisor
+pid_kind() {
+    local pid="$1" cmd
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+        echo none
+        return
+    fi
+    if [ -r "/proc/$pid/cmdline" ]; then
+        cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+        case "$cmd" in
+            *run-controller-loop*) echo supervisor ;;
+            *remote_control.controller.main*) echo legacy ;;
+            *) echo none ;;
+        esac
+    else
+        echo supervisor
+    fi
+}
+
 # Поиск директории проекта
 find_project_dir() {
     if [ -f "$HOME/.termux/project_dir" ]; then
@@ -33,12 +56,21 @@ fi
 
 start_controller() {
     if [ -f "$PIDFILE" ]; then
-        local existing_pid
+        local existing_pid kind
         existing_pid=$(cat "$PIDFILE" 2>/dev/null)
-        if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
-            echo "❌ Контроллер уже запущен (PID: $existing_pid)"
-            return 1
-        fi
+        kind=$(pid_kind "$existing_pid")
+        case "$kind" in
+            supervisor)
+                echo "❌ Контроллер уже запущен (supervisor PID: $existing_pid)"
+                return 1
+                ;;
+            legacy)
+                echo "❌ Контроллер запущен старой версией скрипта без автоперезапуска (PID: $existing_pid)."
+                echo "   Выполните: $0 restart"
+                return 1
+                ;;
+        esac
+        rm -f "$PIDFILE"
     fi
 
     echo "▶️  Запуск контроллера..."
@@ -49,16 +81,20 @@ start_controller() {
         exit 1
     fi
 
-    source .venv/bin/activate || { echo "❌ Не удалось активировать venv"; exit 1; }
-
     if [ ! -f .env ]; then
         echo "❌ Файл .env не найден в $PROJECT_DIR"
         exit 1
     fi
 
-    nohup python -m remote_control.controller.main >> "$LOGFILE" 2>&1 &
-    CONTROLLER_PID=$!
-    echo $CONTROLLER_PID > "$PIDFILE"
+    local loop_script="$PROJECT_DIR/scripts/termux/run-controller-loop.sh"
+    if [ ! -f "$loop_script" ]; then
+        echo "❌ Не найден $loop_script. Обновите проект (git pull) и повторите."
+        exit 1
+    fi
+
+    nohup bash "$loop_script" "$PROJECT_DIR" >> "$LOGFILE" 2>&1 &
+    SUPERVISOR_PID=$!
+    echo $SUPERVISOR_PID > "$PIDFILE"
 
     if command -v termux-wake-lock >/dev/null 2>&1; then
         termux-wake-lock
@@ -66,11 +102,11 @@ start_controller() {
 
     sleep 1
 
-    if kill -0 "$CONTROLLER_PID" 2>/dev/null; then
-        echo "✅ Контроллер запущен (PID: $CONTROLLER_PID)"
+    if kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
+        echo "✅ Контроллер запущен под supervisor (PID: $SUPERVISOR_PID), при падении перезапустится сам"
         echo "📝 Логи: tail -f $LOGFILE"
     else
-        echo "❌ Не удалось запустить контроллер, проверьте логи:"
+        echo "❌ Не удалось запустить supervisor, проверьте логи:"
         tail -n 20 "$LOGFILE"
         rm -f "$PIDFILE"
         exit 1
@@ -84,47 +120,69 @@ stop_controller() {
     fi
 
     PID=$(cat "$PIDFILE" 2>/dev/null)
-    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
-        echo "⏹️  Остановка контроллера (PID: $PID)..."
-        kill -TERM "$PID"
-
-        # Ожидание корректного завершения (до 10 секунд)
-        for i in {1..10}; do
-            if ! kill -0 "$PID" 2>/dev/null; then
-                break
-            fi
-            sleep 1
-        done
-
-        # Принудительное завершение если не остановился
-        if kill -0 "$PID" 2>/dev/null; then
-            echo "⚠️  Принудительное завершение..."
-            kill -KILL "$PID"
-            sleep 1
-        fi
-
+    local kind
+    kind=$(pid_kind "$PID")
+    if [ "$kind" = "none" ]; then
+        echo "❌ Процесс не найден (или PID занят чужим процессом), удаляю устаревший PID"
         rm -f "$PIDFILE"
-
-        if command -v termux-wake-unlock >/dev/null 2>&1; then
-            termux-wake-unlock
-        fi
-
-        echo "✅ Контроллер остановлен"
-    else
-        echo "❌ Процесс не найден, удаляю устаревший PID"
-        rm -f "$PIDFILE"
+        return 1
     fi
+
+    echo "⏹️  Остановка контроллера (PID: $PID, $kind)..."
+    kill -TERM "$PID"
+
+    # Ожидание корректного завершения (до 10 секунд)
+    for _ in {1..10}; do
+        if ! kill -0 "$PID" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+
+    # Принудительное завершение если не остановился
+    if kill -0 "$PID" 2>/dev/null; then
+        echo "⚠️  Принудительное завершение..."
+        kill -KILL "$PID"
+        sleep 1
+    fi
+
+    # Добиваем возможного «сироту»: контроллер, переживший принудительное завершение supervisor
+    if command -v pkill >/dev/null 2>&1; then
+        pkill -f "remote_control.controller.main" 2>/dev/null || true
+    fi
+
+    rm -f "$PIDFILE"
+
+    if command -v termux-wake-unlock >/dev/null 2>&1; then
+        termux-wake-unlock
+    fi
+
+    echo "✅ Контроллер остановлен"
 }
 
 status_controller() {
     if [ -f "$PIDFILE" ]; then
         PID=$(cat "$PIDFILE" 2>/dev/null)
-        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
-            echo "✅ Контроллер работает (PID: $PID)"
+        local kind
+        kind=$(pid_kind "$PID")
+        if [ "$kind" != "none" ]; then
+            if [ "$kind" = "supervisor" ]; then
+                echo "✅ Контроллер работает под supervisor (PID: $PID)"
+            else
+                echo "⚠️  Контроллер работает без supervisor, старая версия скрипта (PID: $PID)"
+            fi
             echo ""
             echo "Информация о процессе:"
             ps -p "$PID" -o pid,comm,%cpu,%mem,etime 2>/dev/null || \
                 ps | grep "$PID" | head -1
+            if command -v pgrep >/dev/null 2>&1; then
+                CHILD=$(pgrep -f "remote_control.controller.main" | head -1)
+                if [ -n "$CHILD" ]; then
+                    echo "Контроллер (python) PID: $CHILD"
+                else
+                    echo "⚠️  Процесс python контроллера сейчас не найден (идёт перезапуск?)"
+                fi
+            fi
             echo ""
             echo "📁 Директория проекта: $PROJECT_DIR"
             echo "📝 Лог-файл: $LOGFILE"

@@ -34,9 +34,18 @@ $NovaPath = "M:\Nova\Nova.exe"
 $VenvPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 $EnvFile = Join-Path $ProjectRoot ".env"
 
+# Скрипт запускается свёрнутым из автозагрузки, поэтому консольный вывод теряется.
+# Дублируем лог в файл (рядом с логом агента: %LOCALAPPDATA%\RemoteControl\logs).
+$LocalRoot = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { $ProjectRoot }
+$LogDir = Join-Path $LocalRoot "RemoteControl\logs"
+$LogFile = Join-Path $LogDir "start_services.log"
+try { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null } catch { }
+
 function Write-Log([string]$Message, [string]$Level = "INFO") {
     $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-    Write-Host "[$timestamp] [$Level] $Message"
+    $line = "[$timestamp] [$Level] $Message"
+    Write-Host $line
+    try { Add-Content -Path $LogFile -Value $line -Encoding UTF8 } catch { }
 }
 
 Write-Log "=== Запуск сервисов Telegram Remote Control ==="
@@ -63,30 +72,38 @@ if ($RequireWol) {
     $wakeStatusUrl = "http://" + $controllerHost + ":" + $controllerPort + "/api/v1/wake/status?consume=true&window=300"
     $targetAddr = "$controllerHost" + ":" + "$controllerPort"
     $wakeConfirmed = $false
+    $controllerAnswered = $false
+    # ПК может загрузиться раньше, чем поднимется сеть или контроллер: ждём до ~1 минуты.
+    $maxAttempts = 12
 
-    for ($attempt = 1; $attempt -le 5; $attempt++) {
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
         try {
             $resp = Invoke-RestMethod -Uri $wakeStatusUrl -Method Get -TimeoutSec 3 -ErrorAction Stop
+            $controllerAnswered = $true
             if ($resp -and $resp.wake_requested -eq $true) {
                 $wakeConfirmed = $true
-                break
-            } else {
-                Write-Log -Message "Контроллер ответил: Запрос Wake-on-LAN не зафиксирован (ПК запущен вручную)." -Level "INFO"
-                break
             }
+            break
         } catch {
-            Write-Log -Message "Попытка $attempt/5: Ожидание связи с Контроллером ${targetAddr}..." -Level "DEBUG"
-            Start-Sleep -Seconds 2
+            Write-Log -Message "Попытка ${attempt}/${maxAttempts}: Контроллер ${targetAddr} пока недоступен ($($_.Exception.Message))" -Level "DEBUG"
+            Start-Sleep -Seconds 3
         }
     }
 
-    if (-not $wakeConfirmed) {
-        Write-Log -Message "Компьютер включен вручную (обычный запуск). Фоновые службы Remote Control пропущены." -Level "INFO"
+    if ($controllerAnswered -and -not $wakeConfirmed) {
+        # Пропускаем запуск ТОЛЬКО если контроллер реально ответил, что Wake-on-LAN не запрашивался.
+        Write-Log -Message "Контроллер ответил: запрос Wake-on-LAN не зафиксирован (ПК запущен вручную). Фоновые службы Remote Control пропущены." -Level "INFO"
+        Write-Log -Message "Чтобы агент стартовал и при ручном включении, переустановите автозапуск: scripts\install_autostart.ps1 -Always" -Level "INFO"
         Write-Log -Message "=== Завершение работы без запуска сервисов ===" -Level "INFO"
         exit 0
     }
 
-    Write-Log -Message "Запрос Wake-on-LAN подтвержден Контроллером! Выполняется запуск фоновых сервисов..." -Level "INFO"
+    if (-not $controllerAnswered) {
+        # Раньше недоступный контроллер трактовался как «ручное включение» и агент не стартовал вовсе.
+        Write-Log -Message "Контроллер ${targetAddr} не ответил за $maxAttempts попыток. Проверить запрос Wake-on-LAN невозможно, службы запускаются на всякий случай (агент сам переподключится, когда контроллер станет доступен)." -Level "WARN"
+    } else {
+        Write-Log -Message "Запрос Wake-on-LAN подтвержден Контроллером! Выполняется запуск фоновых сервисов..." -Level "INFO"
+    }
 }
 
 # 1. Запуск AG_2.19.1.exe
@@ -170,6 +187,10 @@ if ($resolvedMode -eq "auto") {
     Write-Log "Режим auto определён по .env как: '$resolvedMode' (CONTROLLER_MODE=$controllerMode)."
 }
 
+if ($resolvedMode -in @("controller", "bot", "both")) {
+    Write-Log "ВНИМАНИЕ: на этом ПК будет запущен Controller (Telegram-бот). Если бот уже работает на другом устройстве с тем же TELEGRAM_BOT_TOKEN, два экземпляра будут конфликтовать за getUpdates (TelegramConflictError). Для схемы Android Controller + Windows Agent на ПК нужен CONTROLLER_MODE=distributed." "WARN"
+}
+
 # 6. Запуск выбранных процессов
 Set-Location -Path $ProjectRoot
 
@@ -177,7 +198,7 @@ switch ($resolvedMode) {
     "agent" {
         Write-Log "Запуск Windows Agent (remote_control.agent.main)..."
         Start-Process -FilePath $VenvPython -ArgumentList "-m", "remote_control.agent.main" -WorkingDirectory $ProjectRoot
-        Write-Log "Windows Agent запущен в фоновом процессе."
+        Write-Log "Windows Agent запущен в фоновом процессе. Лог агента: $LogDir\agent.log"
     }
     { $_ -in "controller", "bot" } {
         Write-Log "Запуск Controller Bot (remote_control.controller.main)..."

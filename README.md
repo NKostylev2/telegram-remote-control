@@ -293,4 +293,5 @@ ruff check .
 * [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — Детальное описание архитектуры v2, протокол взаимодействия HTTP/HMAC, физика WoL и модель состояний задач.
 * [docs/PROJECT_SPEC.md](docs/PROJECT_SPEC.md) — Спецификация функциональных требований и пользовательских сценариев.
 * [docs/SECURITY.md](docs/SECURITY.md) — Модель угроз, криптографическая валидация HMAC-SHA256, защита от Replay-атак и изоляция рабочих процессов.
+* [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — Диагностика: «после включения ПК ничего не работает», логи, `scripts/diagnose.ps1`, автозапуск и supervisor контроллера.
 * [docs/ROADMAP.md](docs/ROADMAP.md) — Поэтапный отчет о завершённых стадиях разработки и критериях приёмки.

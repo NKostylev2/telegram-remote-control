@@ -21,6 +21,7 @@ from pathlib import Path
 
 from remote_control.agent.agy_client import AgyClient
 from remote_control.agent.client import AgentHttpClient, AgentUnauthorizedError
+from remote_control.agent.connection_monitor import ConnectionMonitor
 from remote_control.agent.screenshot import capture_desktop_screenshot, set_keep_display_awake
 from remote_control.common.models import TaskResult, TaskStatus
 from remote_control.common.protocol import (
@@ -39,6 +40,9 @@ logger = logging.getLogger(__name__)
 
 class AgentRunner:
     """Core controller for Windows Agent operations and task processing."""
+
+    # Pause between heartbeats. A class attribute so tests can shorten it.
+    HEARTBEAT_INTERVAL_SECONDS = 5.0
 
     def __init__(
         self,
@@ -63,6 +67,10 @@ class AgentRunner:
             secret=secret_str,
         )
         self.agy_client = agy_client or AgyClient(config)
+
+        # Connectivity state per channel; turns silent failures into visible log lines.
+        self._heartbeat_monitor = ConnectionMonitor("heartbeat", base_url)
+        self._poll_monitor = ConnectionMonitor("poll", base_url)
 
         self._running = False
         self._current_task_assignment: AgentTaskAssignment | None = None
@@ -164,12 +172,12 @@ class AgentRunner:
         while self._running:
             try:
                 await self._heartbeat_once()
+                self._heartbeat_monitor.success()
             except AgentUnauthorizedError as e:
-                logger.critical("Authentication error communicating with Controller: %s", e)
-                await asyncio.sleep(5.0)
+                self._heartbeat_monitor.unauthorized(e)
             except Exception as e:
-                logger.debug("Heartbeat error: %s", e)
-            await asyncio.sleep(5.0)
+                self._heartbeat_monitor.failure(e)
+            await asyncio.sleep(self.HEARTBEAT_INTERVAL_SECONDS)
 
     # -------------------------------------------------------------------------
     # Task Execution Routine
@@ -297,16 +305,17 @@ class AgentRunner:
                 if self._current_task_assignment is None:
                     resp = await self.client.poll_tasks(max_tasks=1)
                     backoff = poll_interval  # Reset backoff on successful connect
+                    self._poll_monitor.success()
 
                     if resp.tasks:
                         task_to_run = resp.tasks[0]
                         async with self._task_lock:
                             await self._execute_assigned_task(task_to_run)
             except AgentUnauthorizedError as e:
-                logger.critical("Authentication failure polling tasks: %s", e)
+                self._poll_monitor.unauthorized(e)
                 await asyncio.sleep(5.0)
             except Exception as e:
-                logger.debug("Poll connection error: %s (backing off %.1fs)", e, backoff)
+                self._poll_monitor.failure(e)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 1.5, max_backoff)
                 continue
