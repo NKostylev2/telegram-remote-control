@@ -27,6 +27,9 @@ from remote_control.common.protocol import (
     AgentTaskAssignment,
     DirectoryBrowseRequest,
     DirectoryBrowseResponse,
+    FileItem,
+    FileUploadAck,
+    FileUploadInstruction,
     HeartbeatRequest,
     HeartbeatResponse,
     PollTasksResponse,
@@ -71,12 +74,21 @@ class AgentDispatcher:
         # Remote directory browsing state
         self._available_drives: list[str] = []
         self._pending_browse_req: DirectoryBrowseRequest | None = None
-        self._pending_browse_futures: dict[str, asyncio.Future[list[str]]] = {}
-        self._browse_cache: dict[str, tuple[float, list[Path]]] = {}
+        self._pending_browse_futures: dict[str, asyncio.Future[DirectoryBrowseResponse]] = {}
+        self._browse_cache: dict[str, tuple[float, list[Path], list[FileItem]]] = {}
+
+        # Remote file transfer state
+        self._pending_download_req: tuple[str, str] | None = None  # (req_id, remote_path)
+        self._pending_download_futures: dict[str, asyncio.Future[tuple[str, bytes]]] = {}
+        self._pending_upload_instructions: dict[str, FileUploadInstruction] = {}
+        self._pending_upload_payloads: dict[str, bytes] = {}
+        self._pending_upload_futures: dict[str, asyncio.Future[FileUploadAck]] = {}
+        self._queued_upload_id: str | None = None
 
         self._last_wake_monotonic: float | None = None
         self._on_agent_online: Callable[[], None] | None = None
         self._lock = asyncio.Lock()
+
 
     def set_on_agent_online(self, callback: Callable[[], None]) -> None:
         """Register a callback invoked whenever the Windows Agent checks in online."""
@@ -178,12 +190,8 @@ class AgentDispatcher:
         if active_id is None and self._assigned_tasks:
             active_id = next(iter(self._assigned_tasks.keys()))
 
-        browse_id = None
-        browse_path = None
-        if self._pending_browse_req is not None:
-            browse_id = self._pending_browse_req.request_id
-            browse_path = self._pending_browse_req.path
-            self._pending_browse_req = None
+        async with self._lock:
+            browse_id, browse_path, dl_id, dl_path, up_id = self._pop_pending_signals()
 
         return HeartbeatResponse(
             acknowledged=True,
@@ -192,7 +200,32 @@ class AgentDispatcher:
             screenshot_requested=self._screenshot_requested,
             browse_request_id=browse_id,
             browse_request_path=browse_path,
+            file_download_request_id=dl_id,
+            file_download_path=dl_path,
+            file_upload_request_id=up_id,
         )
+
+    def _pop_pending_signals(
+        self,
+    ) -> tuple[str | None, str | None, str | None, str | None, str | None]:
+        """Pop and return (browse_id, browse_path, dl_id, dl_path, up_id)."""
+        browse_id = None
+        browse_path = None
+        if self._pending_browse_req is not None:
+            browse_id = self._pending_browse_req.request_id
+            browse_path = self._pending_browse_req.path
+            self._pending_browse_req = None
+
+        dl_id = None
+        dl_path = None
+        if self._pending_download_req is not None:
+            dl_id, dl_path = self._pending_download_req
+            self._pending_download_req = None
+
+        up_id = self._queued_upload_id
+        self._queued_upload_id = None
+
+        return browse_id, browse_path, dl_id, dl_path, up_id
 
     # -------------------------------------------------------------------------
     # Task Polling & Dispatch
@@ -210,10 +243,17 @@ class AgentDispatcher:
             interval = getattr(
                 self.config, "agent_poll_interval_seconds", DEFAULT_POLL_INTERVAL_SECONDS
             )
+            browse_id, browse_path, dl_id, dl_path, up_id = self._pop_pending_signals()
             return PollTasksResponse(
                 tasks=tasks_to_deliver,
                 poll_interval_seconds=interval,
+                browse_request_id=browse_id,
+                browse_request_path=browse_path,
+                file_download_request_id=dl_id,
+                file_download_path=dl_path,
+                file_upload_request_id=up_id,
             )
+
 
     async def update_task_status(
         self, req: TaskStatusUpdateRequest
@@ -419,24 +459,24 @@ class AgentDispatcher:
         async with self._lock:
             fut = self._pending_browse_futures.pop(res.request_id, None)
             if fut is not None and not fut.done():
-                fut.set_result(res.subdirectories)
+                fut.set_result(res)
         return True
 
-    async def request_remote_subdirectories(
-        self, path: str, timeout_seconds: float = 4.0
-    ) -> list[Path]:
-        """Request subdirectory list from Windows Agent with caching."""
+    async def request_remote_directory_contents(
+        self, path: str, timeout_seconds: float = 6.0
+    ) -> tuple[list[Path], list[FileItem]]:
+        """Request subdirectories and files from Windows Agent with caching."""
         now = time.monotonic()
         if path in self._browse_cache:
-            cached_time, cached_subdirs = self._browse_cache[path]
+            cached_time, cached_subdirs, cached_files = self._browse_cache[path]
             if now - cached_time < 30.0:
-                return cached_subdirs
+                return cached_subdirs, cached_files
 
         if not self.is_agent_connected():
-            return []
+            return [], []
 
         loop = asyncio.get_running_loop()
-        future: asyncio.Future[list[str]] = loop.create_future()
+        future: asyncio.Future[DirectoryBrowseResponse] = loop.create_future()
         req_id = str(uuid.uuid4())
 
         async with self._lock:
@@ -444,13 +484,150 @@ class AgentDispatcher:
             self._pending_browse_futures[req_id] = future
 
         try:
-            subdirs_str = await asyncio.wait_for(future, timeout=timeout_seconds)
-            subdirs = [Path(p) for p in subdirs_str]
-            self._browse_cache[path] = (now, subdirs)
-            return subdirs
+            resp = await asyncio.wait_for(future, timeout=timeout_seconds)
+            subdirs = [Path(p) for p in resp.subdirectories]
+            files = list(resp.files)
+            self._browse_cache[path] = (now, subdirs, files)
+            return subdirs, files
         except TimeoutError:
             logger.warning("Timeout browsing directory %s from Windows Agent", path)
-            return []
+            return [], []
         finally:
             async with self._lock:
                 self._pending_browse_futures.pop(req_id, None)
+
+    async def request_remote_subdirectories(
+        self, path: str, timeout_seconds: float = 6.0
+    ) -> list[Path]:
+        """Request subdirectory list from Windows Agent with caching."""
+        subdirs, _ = await self.request_remote_directory_contents(
+            path, timeout_seconds=timeout_seconds
+        )
+        return subdirs
+
+    # -------------------------------------------------------------------------
+    # Remote File Transfer (Download & Upload)
+    # -------------------------------------------------------------------------
+
+    async def request_file_download(
+        self, path: str, timeout_seconds: float = 60.0
+    ) -> tuple[str, bytes]:
+        """Instruct Windows Agent to upload a file to Controller and await payload.
+
+        Returns (filename, file_bytes).
+        """
+        if not self.is_agent_connected():
+            raise RuntimeError(
+                "Windows Agent не подключён к Контроллеру. Невозможно скачать файл."
+            )
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[tuple[str, bytes]] = loop.create_future()
+        req_id = str(uuid.uuid4())
+
+        async with self._lock:
+            self._pending_download_req = (req_id, path)
+            self._pending_download_futures[req_id] = future
+
+        try:
+            return await asyncio.wait_for(future, timeout=timeout_seconds)
+        except TimeoutError:
+            raise TimeoutError(
+                f"Таймаут ожидания передачи файла с Windows Agent ({timeout_seconds:.0f} сек)."
+            ) from None
+        finally:
+            async with self._lock:
+                self._pending_download_futures.pop(req_id, None)
+
+    async def submit_file_download(
+        self,
+        request_id: str,
+        filename: str,
+        data: bytes,
+        error: str | None = None,
+    ) -> bool:
+        """Receive uploaded file payload from Windows Agent and resolve waiting future."""
+        async with self._lock:
+            fut = self._pending_download_futures.pop(request_id, None)
+
+        if fut is not None and not fut.done():
+            if error:
+                fut.set_exception(RuntimeError(error))
+            else:
+                fut.set_result((filename, data))
+            return True
+        return False
+
+    async def stage_file_upload(
+        self,
+        target_dir: str,
+        filename: str,
+        file_bytes: bytes,
+        conflict_mode: str = "overwrite",
+        timeout_seconds: float = 60.0,
+    ) -> FileUploadAck:
+        """Stage file on Controller for Windows Agent to fetch and write.
+
+        Awaits FileUploadAck from Windows Agent.
+        """
+        if not self.is_agent_connected():
+            raise RuntimeError(
+                "Windows Agent не подключён к Контроллеру. Невозможно отправить файл."
+            )
+
+        transfer_id = str(uuid.uuid4())
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[FileUploadAck] = loop.create_future()
+
+        instruction = FileUploadInstruction(
+            transfer_id=transfer_id,
+            target_dir=target_dir,
+            filename=filename,
+            conflict_mode=conflict_mode,
+            file_size=len(file_bytes),
+        )
+
+        async with self._lock:
+            self._pending_upload_instructions[transfer_id] = instruction
+            self._pending_upload_payloads[transfer_id] = file_bytes
+            self._pending_upload_futures[transfer_id] = future
+            self._queued_upload_id = transfer_id
+
+        try:
+            return await asyncio.wait_for(future, timeout=timeout_seconds)
+        except TimeoutError:
+            raise TimeoutError(
+                f"Таймаут ожидания сохранения файла на Windows Agent ({timeout_seconds:.0f} сек)."
+            ) from None
+        finally:
+            async with self._lock:
+                self._pending_upload_instructions.pop(transfer_id, None)
+                self._pending_upload_payloads.pop(transfer_id, None)
+                self._pending_upload_futures.pop(transfer_id, None)
+                if self._queued_upload_id == transfer_id:
+                    self._queued_upload_id = None
+
+    def get_staged_upload(
+        self, transfer_id: str
+    ) -> tuple[FileUploadInstruction, bytes] | None:
+        """Retrieve staged upload instruction and bytes for Windows Agent."""
+        instr = self._pending_upload_instructions.get(transfer_id)
+        payload = self._pending_upload_payloads.get(transfer_id)
+        if instr is not None and payload is not None:
+            return instr, payload
+        return None
+
+    async def submit_upload_ack(self, ack: FileUploadAck) -> bool:
+        """Resolve waiting upload future when Windows Agent confirms file write."""
+        async with self._lock:
+            fut = self._pending_upload_futures.pop(ack.transfer_id, None)
+            self._pending_upload_instructions.pop(ack.transfer_id, None)
+            self._pending_upload_payloads.pop(ack.transfer_id, None)
+            if self._queued_upload_id == ack.transfer_id:
+                self._queued_upload_id = None
+
+        if fut is not None and not fut.done():
+            fut.set_result(ack)
+            return True
+        return False
+

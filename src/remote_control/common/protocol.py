@@ -30,7 +30,10 @@ MIN_POLL_INTERVAL_SECONDS = 0.1
 MAX_POLL_INTERVAL_SECONDS = 10.0
 HEARTBEAT_TIMEOUT_SECONDS = 30.0
 MAX_TIMESTAMP_DRIFT_SECONDS = 60.0
-MAX_PAYLOAD_BYTES = 10 * 1024 * 1024  # 10 MB limit
+MAX_FILE_DOWNLOAD_BYTES = 50 * 1024 * 1024  # 50 MB limit (Telegram send document limit)
+MAX_FILE_UPLOAD_BYTES = 20 * 1024 * 1024    # 20 MB limit (Telegram bot download limit)
+MAX_PAYLOAD_BYTES = 60 * 1024 * 1024        # 60 MB limit for server payload
+
 
 
 class AgentState(StrEnum):
@@ -155,6 +158,9 @@ class HeartbeatResponse(BaseModel):
     screenshot_requested: bool = False
     browse_request_id: str | None = None
     browse_request_path: str | None = None
+    file_download_request_id: str | None = None
+    file_download_path: str | None = None
+    file_upload_request_id: str | None = None
 
 
 class AgentTaskAssignment(BaseModel):
@@ -194,6 +200,11 @@ class PollTasksResponse(BaseModel):
     protocol_version: str = PROTOCOL_VERSION
     tasks: list[AgentTaskAssignment] = Field(default_factory=list)
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS
+    browse_request_id: str | None = None
+    browse_request_path: str | None = None
+    file_download_request_id: str | None = None
+    file_download_path: str | None = None
+    file_upload_request_id: str | None = None
 
 
 class TaskStatusUpdateRequest(BaseModel):
@@ -263,6 +274,16 @@ class ScreenshotMetadata(BaseModel):
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class FileItem(BaseModel):
+    """Representation of a filesystem file in directory listing."""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    size_bytes: int
+    modified_at: float | None = None
+
+
 class DirectoryBrowseRequest(BaseModel):
     """Directory inspection instruction sent by Controller."""
 
@@ -281,7 +302,42 @@ class DirectoryBrowseResponse(BaseModel):
     request_id: str
     path: str
     subdirectories: list[str] = Field(default_factory=list)
+    files: list[FileItem] = Field(default_factory=list)
     error: str | None = None
+
+
+class FileDownloadInstruction(BaseModel):
+    """Instruction for Windows Agent to upload a local file to Controller."""
+
+    model_config = ConfigDict(frozen=True)
+
+    request_id: str
+    path: str
+
+
+class FileUploadInstruction(BaseModel):
+    """Metadata for a pending file download from Controller to Windows Agent."""
+
+    model_config = ConfigDict(frozen=True)
+
+    transfer_id: str
+    target_dir: str
+    filename: str
+    conflict_mode: str = "overwrite"  # "overwrite" | "suffix"
+    file_size: int = 0
+
+
+class FileUploadAck(BaseModel):
+    """Acknowledgement sent by Windows Agent after writing an uploaded file."""
+
+    model_config = ConfigDict(frozen=True)
+
+    transfer_id: str
+    success: bool
+    saved_path: str = ""
+    bytes_written: int = 0
+    error: str | None = None
+
 
 
 class AgentStatusInfo(BaseModel):

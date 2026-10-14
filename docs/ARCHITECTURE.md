@@ -452,3 +452,60 @@ stateDiagram-v2
   - Если задача отменяется через `/cancel` в Telegram, идентификатор задачи добавляется в `_cancel_task_ids` диспетчера.
   - Windows Agent получает уведомление об отмене в ответе на heartbeat или опрос и выполняет немедленное гарантированное завершение дерева дочерних процессов `agy.exe` через `taskkill /T /F` на Windows.
 
+---
+
+## 8. Подсистема двусторонней передачи файлов и проводника (File Transfer)
+
+Реализована надёжная двусторонняя передача файлов между Android-контроллером и Windows-агентом с поддержкой как локального (`local`), так и распределённого (`distributed`) режимов:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as Telegram User
+    participant Bot as Controller (Android)
+    participant Agent as Windows Agent (PC)
+
+    Note over User, Agent: Сценарий 1: Скачивание (PC ➔ Telegram)
+    User->>Bot: /files или клик по файлу (fb:dl:idx) /download <path>
+    Bot->>Agent: Сигнал file_download_request в ответе на poll / heartbeat
+    Agent->>Agent: Чтение файла с диска Windows (лимит 50 МБ)
+    Agent->>Bot: POST /api/v1/agent/files/download (HMAC + binary body)
+    Bot->>User: BufferedInputFile (send_document в Telegram)
+
+    Note over User, Agent: Сценарий 2: Загрузка (Telegram ➔ PC)
+    User->>Bot: Отправка документа в чат (лимит 20 МБ)
+    Bot->>Bot: Сохранение во временное хранилище на контроллере
+    Bot->>User: Выбор целевой папки (активный воркспейс / диск / проводник)
+    User->>Bot: Выбор папки
+    Bot->>Bot: Проверка конфликта имён (существует ли файл)
+    alt Файл уже существует (Конфликт имён)
+        Bot->>User: Кнопки: «Перезаписать» / «Суффикс (1)» / «Отмена»
+        User->>Bot: Выбор действия (fu:act:ovw или fu:act:suf)
+    end
+    Bot->>Agent: Сигнал file_upload_request_id в ответе на poll / heartbeat
+    Agent->>Bot: GET /api/v1/agent/files/upload/{transfer_id} (HMAC)
+    Bot->>Agent: Binary payload + X-Target-Dir + X-Conflict-Mode
+    Agent->>Agent: Запись на диск Windows (при необходимости генерация суффикса)
+    Agent->>Bot: POST /api/v1/agent/files/upload/{transfer_id}/ack
+    Bot->>User: «✅ Файл успешно сохранён на ПК: <путь>»
+```
+
+### 8.1. Спецификация REST-эндпоинтов передачи файлов
+* `POST /api/v1/agent/files/download`:
+  * Windows Agent передаёт бинарные данные скачиваемого файла контроллеру.
+  * Заголовки: `X-Request-ID`, `X-File-Name` (URL-encoded), `X-File-Error` (опционально при сбое чтения), `X-Signature`, `X-Timestamp`.
+  * Лимит размера полезной нагрузки `client_max_size`: **60 МБ** (`MAX_PAYLOAD_BYTES`).
+* `GET /api/v1/agent/files/upload/{transfer_id}`:
+  * Windows Agent забирает бинарные данные файла, временно сохранённого на контроллере.
+  * Заголовки ответа: `X-Target-Dir` (URL-encoded), `X-Target-Filename` (URL-encoded), `X-Conflict-Mode` (`overwrite` | `suffix`), `X-File-Size`.
+* `POST /api/v1/agent/files/upload/{transfer_id}/ack`:
+  * Windows Agent подтверждает контроллеру успешность записи файла на диск либо сообщает об ошибке.
+  * Тело запроса: JSON-объект `FileUploadAck(transfer_id, success, saved_path, bytes_written, error)`.
+
+### 8.2. Лимиты и безопасность
+* **Лимит скачивания (PC ➔ Telegram)**: **50 МБ** (ограничение Telegram Bot API на отправку документов). При превышении бот информирует пользователя о фактическом размере.
+* **Лимит загрузки (Telegram ➔ PC)**: **20 МБ** (ограничение Telegram Bot API на скачивание файлов ботом).
+* **Безопасность кодировки путей**: Все пути и имена файлов в HTTP-заголовках экранируются через `urllib.parse.quote(..., safe="")` для предотвращения `UnicodeEncodeError` с кириллическими символами в стандарте RFC 7230.
+* **Свободный доступ к файловой системе**: По требованию пользователя искусственные ограничения Path Traversal к единой директории для проводника файлов отключены — обеспечен полный доступ ко всем подключённым дискам Windows.
+
+

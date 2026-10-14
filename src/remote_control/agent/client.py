@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import quote, unquote
 
 import aiohttp
 
 from remote_control.common.protocol import (
     DirectoryBrowseResponse,
+    FileUploadAck,
     HeartbeatRequest,
     HeartbeatResponse,
     PollTasksResponse,
@@ -27,6 +29,7 @@ from remote_control.common.protocol import (
     TaskStatusUpdateResponse,
     build_auth_headers,
 )
+
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +173,68 @@ class AgentHttpClient:
         async with session.post(url, data=body_bytes, headers=headers) as resp:
             return resp.status == 200
 
+    async def upload_downloaded_file(
+        self,
+        request_id: str,
+        filename: str,
+        data: bytes,
+        error: str | None = None,
+    ) -> bool:
+        """Upload a file downloaded from Windows PC to the Controller."""
+        session = await self._get_session()
+        path = "/api/v1/agent/files/download"
+        headers = self._prepare_headers("POST", path, data)
+        headers["X-Request-ID"] = request_id
+        headers["X-File-Name"] = quote(filename)
+        if error:
+            headers["X-File-Error"] = quote(error)
+        headers["Content-Type"] = "application/octet-stream"
+
+        url = f"{self.base_url}{path}"
+        async with session.post(url, data=data, headers=headers) as resp:
+            if resp.status == 401:
+                raise AgentUnauthorizedError("Controller rejected authentication credentials (401)")
+            return resp.status == 200
+
+    async def fetch_staged_upload(
+        self, transfer_id: str
+    ) -> tuple[dict[str, str], bytes]:
+        """Fetch a file staged on Controller for writing to local Windows disk."""
+        session = await self._get_session()
+        path = f"/api/v1/agent/files/upload/{transfer_id}"
+        headers = self._prepare_headers("GET", path)
+
+        url = f"{self.base_url}{path}"
+        async with session.get(url, headers=headers) as resp:
+            if resp.status == 401:
+                raise AgentUnauthorizedError("Controller rejected authentication credentials (401)")
+            resp.raise_for_status()
+            target_dir = unquote(resp.headers.get("X-Target-Dir", ""))
+            filename = unquote(resp.headers.get("X-Target-Filename", ""))
+            conflict_mode = resp.headers.get("X-Conflict-Mode", "overwrite")
+            data = await resp.read()
+            metadata = {
+                "transfer_id": transfer_id,
+                "target_dir": target_dir,
+                "filename": filename,
+                "conflict_mode": conflict_mode,
+            }
+            return metadata, data
+
+    async def acknowledge_upload(self, ack: FileUploadAck) -> bool:
+        """Send confirmation to Controller after saving uploaded file to local disk."""
+        session = await self._get_session()
+        path = f"/api/v1/agent/files/upload/{ack.transfer_id}/ack"
+        body_bytes = ack.model_dump_json().encode("utf-8")
+        headers = self._prepare_headers("POST", path, body_bytes)
+        headers["Content-Type"] = "application/json"
+
+        url = f"{self.base_url}{path}"
+        async with session.post(url, data=body_bytes, headers=headers) as resp:
+            if resp.status == 401:
+                raise AgentUnauthorizedError("Controller rejected authentication credentials (401)")
+            return resp.status == 200
+
     async def get_controller_status(self) -> dict[str, Any]:
         """Fetch general status and diagnostics from Controller."""
         session = await self._get_session()
@@ -177,3 +242,4 @@ class AgentHttpClient:
         async with session.get(f"{self.base_url}{path}") as resp:
             resp.raise_for_status()
             return await resp.json()
+

@@ -26,14 +26,23 @@ from remote_control.agent.screenshot import capture_desktop_screenshot, set_keep
 from remote_control.common.models import TaskResult, TaskStatus
 from remote_control.common.protocol import (
     DEFAULT_POLL_INTERVAL_SECONDS,
+    MAX_FILE_DOWNLOAD_BYTES,
     AgentTaskAssignment,
     DirectoryBrowseResponse,
+    FileUploadAck,
     HeartbeatRequest,
+    HeartbeatResponse,
+    PollTasksResponse,
     TaskResultSubmission,
     TaskStatusUpdateRequest,
 )
 from remote_control.config import AppConfig
-from remote_control.controller.browser import get_available_drives, list_subdirectories
+from remote_control.controller.browser import (
+    get_available_drives,
+    list_directory_contents,
+    list_subdirectories,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -125,20 +134,41 @@ class AgentRunner:
             logger.info("Controller requested desktop screenshot. Capturing...")
             await self._capture_and_upload_screenshot()
 
-        # Check for directory browsing request
+        # Check for directory browsing and file transfer requests
+        self._dispatch_signals(resp)
+
+    def _dispatch_signals(self, resp: HeartbeatResponse | PollTasksResponse) -> None:
+        """Handle background out-of-band requests (browse, download, upload)."""
         if resp.browse_request_id and resp.browse_request_path:
-            logger.info("Controller requested directory listing for: %s", resp.browse_request_path)
-            await self._handle_browse_request(resp.browse_request_id, resp.browse_request_path)
+            logger.info("Dispatched browse request for: %s", resp.browse_request_path)
+            asyncio.create_task(
+                self._handle_browse_request(resp.browse_request_id, resp.browse_request_path)
+            )
+
+        if resp.file_download_request_id and resp.file_download_path:
+            logger.info("Dispatched file download request for: %s", resp.file_download_path)
+            asyncio.create_task(
+                self._handle_download_request(
+                    resp.file_download_request_id, resp.file_download_path
+                )
+            )
+
+        if resp.file_upload_request_id:
+            logger.info("Dispatched file upload request: %s", resp.file_upload_request_id)
+            asyncio.create_task(
+                self._handle_upload_request(resp.file_upload_request_id)
+            )
 
     async def _handle_browse_request(self, req_id: str, dir_path: str) -> None:
-        """Inspect subdirectories on Windows host and report back to Controller."""
+        """Inspect subdirectories and files on Windows host and report back to Controller."""
         try:
-            subdirs = await asyncio.to_thread(list_subdirectories, Path(dir_path))
+            subdirs, files = await asyncio.to_thread(list_directory_contents, Path(dir_path))
             subdirs_str = [str(p) for p in subdirs]
             result = DirectoryBrowseResponse(
                 request_id=req_id,
                 path=dir_path,
                 subdirectories=subdirs_str,
+                files=files,
             )
         except Exception as e:
             logger.warning("Error browsing directory %s: %s", dir_path, e)
@@ -146,9 +176,91 @@ class AgentRunner:
                 request_id=req_id,
                 path=dir_path,
                 subdirectories=[],
+                files=[],
                 error=str(e),
             )
         await self.client.submit_browse_response(result)
+
+    async def _handle_download_request(self, req_id: str, file_path_str: str) -> None:
+        """Read requested file from Windows disk and upload to Controller."""
+        try:
+            p = Path(file_path_str)
+            if not p.exists() or not p.is_file():
+                await self.client.upload_downloaded_file(
+                    request_id=req_id,
+                    filename=p.name or "file",
+                    data=b"",
+                    error=f"Файл не найден на диске: {file_path_str}",
+                )
+                return
+
+            size = p.stat().st_size
+            if size > MAX_FILE_DOWNLOAD_BYTES:
+                size_mb = size / (1024 * 1024)
+                await self.client.upload_downloaded_file(
+                    request_id=req_id,
+                    filename=p.name,
+                    data=b"",
+                    error=f"Файл превышает лимит отправки Telegram (максимум 50 МБ, текущий размер {size_mb:.1f} МБ).",
+                )
+                return
+
+            file_bytes = await asyncio.to_thread(p.read_bytes)
+            await self.client.upload_downloaded_file(
+                request_id=req_id,
+                filename=p.name,
+                data=file_bytes,
+            )
+            logger.info(
+                "Successfully uploaded requested file %s (%d bytes)", p.name, len(file_bytes)
+            )
+        except Exception as e:
+            logger.exception("Error handling download request for %s: %s", file_path_str, e)
+            await self.client.upload_downloaded_file(
+                request_id=req_id,
+                filename=Path(file_path_str).name or "file",
+                data=b"",
+                error=f"Ошибка чтения файла: {e}",
+            )
+
+    async def _handle_upload_request(self, transfer_id: str) -> None:
+        """Fetch staged file from Controller and save to local Windows disk."""
+        try:
+            meta, file_bytes = await self.client.fetch_staged_upload(transfer_id)
+            target_dir_str = meta.get("target_dir", "")
+            filename = meta.get("filename", "uploaded_file")
+            conflict_mode = meta.get("conflict_mode", "overwrite")
+
+            target_dir = Path(target_dir_str)
+            target_dir.mkdir(parents=True, exist_ok=True)
+
+            dest_path = target_dir / filename
+            if dest_path.exists() and conflict_mode == "suffix":
+                stem = dest_path.stem
+                suffix = dest_path.suffix
+                counter = 1
+                while dest_path.exists():
+                    dest_path = target_dir / f"{stem} ({counter}){suffix}"
+                    counter += 1
+
+            await asyncio.to_thread(dest_path.write_bytes, file_bytes)
+            logger.info("Saved uploaded file to %s (%d bytes)", dest_path, len(file_bytes))
+            ack = FileUploadAck(
+                transfer_id=transfer_id,
+                success=True,
+                saved_path=str(dest_path),
+                bytes_written=len(file_bytes),
+            )
+            await self.client.acknowledge_upload(ack)
+        except Exception as e:
+            logger.exception("Error saving uploaded file %s: %s", transfer_id, e)
+            ack = FileUploadAck(
+                transfer_id=transfer_id,
+                success=False,
+                error=str(e),
+            )
+            await self.client.acknowledge_upload(ack)
+
 
     async def _capture_and_upload_screenshot(self) -> None:
         """Capture display and upload to Controller."""
@@ -306,11 +418,13 @@ class AgentRunner:
                     resp = await self.client.poll_tasks(max_tasks=1)
                     backoff = poll_interval  # Reset backoff on successful connect
                     self._poll_monitor.success()
+                    self._dispatch_signals(resp)
 
                     if resp.tasks:
                         task_to_run = resp.tasks[0]
                         async with self._task_lock:
                             await self._execute_assigned_task(task_to_run)
+
             except AgentUnauthorizedError as e:
                 self._poll_monitor.unauthorized(e)
                 await asyncio.sleep(5.0)

@@ -17,9 +17,12 @@ from typing import Any
 
 from aiohttp import web
 
+from urllib.parse import quote, unquote
+
 from remote_control.common.protocol import (
     MAX_PAYLOAD_BYTES,
     DirectoryBrowseResponse,
+    FileUploadAck,
     HeartbeatRequest,
     TaskResultSubmission,
     TaskStatusUpdateRequest,
@@ -27,6 +30,7 @@ from remote_control.common.protocol import (
 )
 from remote_control.config import AppConfig
 from remote_control.controller.agent_dispatcher import AgentDispatcher
+
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +191,67 @@ def create_controller_app(
             }
         )
 
+    async def handle_file_download(request: web.Request) -> web.Response:
+        req_id = request.headers.get("X-Request-ID") or request.query.get("request_id", "")
+        raw_filename = request.headers.get("X-File-Name", "")
+        filename = unquote(raw_filename) if raw_filename else "downloaded_file"
+        file_err = request.headers.get("X-File-Error")
+        if file_err:
+            file_err = unquote(file_err)
+
+        if not req_id:
+            return web.json_response({"error": "Missing X-Request-ID header"}, status=400)
+
+        if file_err:
+            await dispatcher.submit_file_download(
+                request_id=req_id,
+                filename="",
+                data=b"",
+                error=file_err,
+            )
+            return web.json_response({"acknowledged": True, "error_recorded": True})
+
+        data = await request.read()
+        success = await dispatcher.submit_file_download(
+            request_id=req_id,
+            filename=filename,
+            data=data,
+        )
+        return web.json_response(
+            {"acknowledged": success, "received_bytes": len(data)},
+            status=200 if success else 409,
+        )
+
+    async def handle_file_upload_get(request: web.Request) -> web.Response:
+        transfer_id = request.match_info.get("transfer_id", "")
+        staged = dispatcher.get_staged_upload(transfer_id)
+        if staged is None:
+            return web.json_response({"error": "Upload instruction not found or expired"}, status=404)
+
+        instruction, payload = staged
+        return web.Response(
+            body=payload,
+            content_type="application/octet-stream",
+            headers={
+                "X-Transfer-ID": instruction.transfer_id,
+                "X-Target-Dir": quote(instruction.target_dir),
+                "X-Target-Filename": quote(instruction.filename),
+                "X-Conflict-Mode": instruction.conflict_mode,
+                "X-File-Size": str(len(payload)),
+            },
+        )
+
+    async def handle_file_upload_ack(request: web.Request) -> web.Response:
+        transfer_id = request.match_info.get("transfer_id", "")
+        try:
+            raw_data = await request.json()
+            ack = FileUploadAck.model_validate(raw_data)
+        except Exception as e:
+            return web.json_response({"error": f"Invalid upload ack payload: {e}"}, status=400)
+
+        success = await dispatcher.submit_upload_ack(ack)
+        return web.json_response({"acknowledged": success})
+
     # -------------------------------------------------------------------------
     # Route Registration
     # -------------------------------------------------------------------------
@@ -197,10 +262,14 @@ def create_controller_app(
     app.router.add_post("/api/v1/agent/tasks/{task_id}/result", handle_task_result)
     app.router.add_post("/api/v1/agent/screenshot", handle_screenshot)
     app.router.add_post("/api/v1/agent/browse", handle_browse)
+    app.router.add_post("/api/v1/agent/files/download", handle_file_download)
+    app.router.add_get("/api/v1/agent/files/upload/{transfer_id}", handle_file_upload_get)
+    app.router.add_post("/api/v1/agent/files/upload/{transfer_id}/ack", handle_file_upload_ack)
     app.router.add_get("/api/v1/status", handle_status)
     app.router.add_get("/api/v1/wake/status", handle_wake_status)
 
     return app
+
 
 
 class ControllerServer:
