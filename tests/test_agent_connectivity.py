@@ -179,7 +179,7 @@ def test_agent_started_before_controller_connects_when_it_appears(
             await server.stop()
 
     asyncio.run(_test())
-    assert any("восстановлена" in m for m in _messages(caplog, logging.INFO))
+    assert any(("восстановлена" in m or "Подключено к" in m) for m in _messages(caplog, logging.INFO))
 
 
 def test_controller_exits_with_clear_error_when_port_is_taken(

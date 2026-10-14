@@ -32,6 +32,8 @@ $ProjectRoot = (Resolve-Path "$PSScriptRoot\..").Path
 $AgPath = "M:\Downloads\AG_2.19.1.exe"
 $NovaPath = "M:\Nova\Nova.exe"
 $VenvPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+$VenvPythonW = Join-Path $ProjectRoot ".venv\Scripts\pythonw.exe"
+$AgentPython = if (Test-Path $VenvPythonW) { $VenvPythonW } else { $VenvPython }
 $EnvFile = Join-Path $ProjectRoot ".env"
 
 # Скрипт запускается свёрнутым из автозагрузки, поэтому консольный вывод теряется.
@@ -138,8 +140,8 @@ if (Test-Path $NovaPath) {
 Write-Log "Ожидание инициализации сети ($DelaySeconds сек)..."
 Start-Sleep -Seconds $DelaySeconds
 
-# Проверка доступности локального прокси Nova (127.0.0.1:1372)
-$proxyPort = 1372
+# Проверка доступности локального прокси Nova (127.0.0.1:1370)
+$proxyPort = 1370
 $proxyReady = $false
 try {
     $tcp = New-Object System.Net.Sockets.TcpClient
@@ -196,20 +198,25 @@ Set-Location -Path $ProjectRoot
 
 switch ($resolvedMode) {
     "agent" {
-        Write-Log "Запуск Windows Agent (remote_control.agent.main)..."
-        Start-Process -FilePath $VenvPython -ArgumentList "-m", "remote_control.agent.main" -WorkingDirectory $ProjectRoot
-        Write-Log "Windows Agent запущен в фоновом процессе. Лог агента: $LogDir\agent.log"
+        $existingAgent = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*remote_control.agent.main*" }
+        if ($existingAgent) {
+            Write-Log "Windows Agent уже работает (PID: $($existingAgent.ProcessId -join ', ')). Повторный запуск пропущен." "INFO"
+        } else {
+            Write-Log "Запуск Windows Agent (remote_control.agent.main)..."
+            Start-Process -FilePath $AgentPython -ArgumentList "-m", "remote_control.agent.main" -WorkingDirectory $ProjectRoot -WindowStyle Hidden
+            Write-Log "Windows Agent запущен в фоновом процессе. Лог агента: $LogDir\agent.log"
+        }
     }
     { $_ -in "controller", "bot" } {
         Write-Log "Запуск Controller Bot (remote_control.controller.main)..."
-        Start-Process -FilePath $VenvPython -ArgumentList "-m", "remote_control.controller.main" -WorkingDirectory $ProjectRoot
+        Start-Process -FilePath $AgentPython -ArgumentList "-m", "remote_control.controller.main" -WorkingDirectory $ProjectRoot -WindowStyle Hidden
         Write-Log "Controller Bot запущен в фоновом процессе."
     }
     "both" {
         Write-Log "Запуск Controller Bot и Windows Agent..."
-        Start-Process -FilePath $VenvPython -ArgumentList "-m", "remote_control.controller.main" -WorkingDirectory $ProjectRoot
+        Start-Process -FilePath $AgentPython -ArgumentList "-m", "remote_control.controller.main" -WorkingDirectory $ProjectRoot -WindowStyle Hidden
         Start-Sleep -Seconds 2
-        Start-Process -FilePath $VenvPython -ArgumentList "-m", "remote_control.agent.main" -WorkingDirectory $ProjectRoot
+        Start-Process -FilePath $AgentPython -ArgumentList "-m", "remote_control.agent.main" -WorkingDirectory $ProjectRoot -WindowStyle Hidden
         Write-Log "Оба сервиса (Bot и Agent) запущены."
     }
 }
